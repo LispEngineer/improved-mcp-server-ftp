@@ -1,4 +1,4 @@
-import { Client, FileInfo, FileType } from "basic-ftp";
+import { Client } from "basic-ftp";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -15,80 +15,6 @@ export interface FtpConfig {
 }
 
 export type FileEncoding = "utf8" | "base64";
-
-/**
- * Custom directory listing parser for OpenVMS TCP/IP Services FTP servers.
- * OpenVMS format:
- * FILENAME.EXT;VER   USED/ALLOC   DATE TIME   [UIC]   (PROT)
- * Long filenames may place the size/date on the following line.
- */
-function parseVmsList(rawListing: string): FileInfo[] {
-  const lines = rawListing.split(/\r?\n/);
-  const files: FileInfo[] = [];
-  let pendingName: string | null = null;
-
-  const fileRegex = /^([A-Za-z0-9_$.-]+;[0-9]+)\s+(\d+)\/(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?)/;
-  const nameOnlyRegex = /^([A-Za-z0-9_$.-]+;[0-9]+)\s*$/;
-  const continuationRegex = /^\s+(\d+)\/(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}(?::\d{2})?)/;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trimEnd();
-    if (!line || line.startsWith("Directory ") || line.startsWith("Total of ")) continue;
-
-    if (pendingName) {
-      const contMatch = line.match(continuationRegex);
-      if (contMatch) {
-        const usedBlocks = parseInt(contMatch[1], 10);
-        const dateStr = contMatch[3];
-        const info = new FileInfo(pendingName);
-        info.size = usedBlocks * 512;
-        info.rawModifiedAt = dateStr;
-        const parsedDate = new Date(dateStr);
-        if (!isNaN(parsedDate.getTime())) {
-          info.modifiedAt = parsedDate;
-        }
-        info.type = pendingName.toUpperCase().includes(".DIR;") ? FileType.Directory : FileType.File;
-        files.push(info);
-        pendingName = null;
-        continue;
-      } else {
-        const info = new FileInfo(pendingName);
-        info.type = pendingName.toUpperCase().includes(".DIR;") ? FileType.Directory : FileType.File;
-        files.push(info);
-        pendingName = null;
-      }
-    }
-
-    const match = line.match(fileRegex);
-    if (match) {
-      const name = match[1];
-      const usedBlocks = parseInt(match[2], 10);
-      const dateStr = match[4];
-      const info = new FileInfo(name);
-      info.size = usedBlocks * 512;
-      info.rawModifiedAt = dateStr;
-      const parsedDate = new Date(dateStr);
-      if (!isNaN(parsedDate.getTime())) {
-        info.modifiedAt = parsedDate;
-      }
-      info.type = name.toUpperCase().includes(".DIR;") ? FileType.Directory : FileType.File;
-      files.push(info);
-    } else {
-      const nameMatch = line.match(nameOnlyRegex);
-      if (nameMatch) {
-        pendingName = nameMatch[1];
-      }
-    }
-  }
-
-  if (pendingName) {
-    const info = new FileInfo(pendingName);
-    info.type = pendingName.toUpperCase().includes(".DIR;") ? FileType.Directory : FileType.File;
-    files.push(info);
-  }
-
-  return files;
-}
 
 // Create FTP client wrapper
 export class FtpClient {
@@ -109,19 +35,6 @@ export class FtpClient {
   private async withConnection<T>(operation: (client: Client) => Promise<T>): Promise<T> {
     const client = new Client();
     client.ftp.verbose = false; // Set to true for debugging
-    const defaultParseList = client.parseList.bind(client);
-    client.parseList = (rawList: string) => {
-      try {
-        return defaultParseList(rawList);
-      } catch (err) {
-        const vms = parseVmsList(rawList);
-        if (vms.length > 0 || rawList.includes("Total of 0 files")) {
-          return vms;
-        }
-        throw err;
-      }
-    };
-
     try {
       await client.access({
         host: this.config.host,
@@ -138,14 +51,13 @@ export class FtpClient {
 
   async listDirectory(remotePath: string): Promise<Array<{name: string, type: string, size: number, modifiedDate: string}>> {
     try {
-      const targetPath = (remotePath === "." || remotePath === "./") ? "" : remotePath;
-      const list = await this.withConnection((client) => client.list(targetPath));
+      const list = await this.withConnection((client) => client.list(remotePath));
 
       return list.map(item => ({
         name: item.name,
         type: item.type === 1 ? "file" : item.type === 2 ? "directory" : "other",
         size: item.size,
-        modifiedDate: item.modifiedAt ? item.modifiedAt.toISOString() : item.rawModifiedAt || ""
+        modifiedDate: item.modifiedAt ? item.modifiedAt.toISOString() : ""
       }));
     } catch (error) {
       console.error("List directory error:", error);
@@ -200,17 +112,7 @@ export class FtpClient {
 
   async deleteFile(remotePath: string): Promise<boolean> {
     try {
-      await this.withConnection(async (client) => {
-        try {
-          await client.remove(remotePath);
-        } catch (err: any) {
-          if (err?.message?.includes("version number") && !remotePath.includes(";")) {
-            await client.remove(remotePath + ";0");
-          } else {
-            throw err;
-          }
-        }
-      });
+      await this.withConnection((client) => client.remove(remotePath));
       return true;
     } catch (error) {
       console.error("Delete file error:", error);
