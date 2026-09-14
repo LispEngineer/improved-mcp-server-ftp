@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.3.0 — 2026-09-13
+**Contributors**: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`)
+
+### Added
+- **Dynamic per-transaction connection parameters**: All nine tools (`list-directory`, `download-file`, `upload-file`, `create-directory`, `delete-file`, `delete-directory`, `rename-file`, `edit-file`, `append-file`) now accept optional `host`, `port`, `protocol`, `user`, `password`, and `secure` arguments. This allows an AI agent to target multiple FTP/SFTP servers dynamically from a single MCP server instance.
+- **OpenVMS TCP/IP Services FTP support**:
+  - Implemented `parseVmsList` parser fallback in `FtpClient` to recognize and parse OpenVMS directory listings (`FILENAME.EXT;VER`, 512-byte blocks, timestamps, `*.DIR;*` directories, and multi-line continuation entries).
+  - Versioned deletion fallback: OpenVMS `DELE` requires a version number; unversioned deletions now automatically retry with `;0` (latest version) upon receiving a version requirement error from OpenVMS.
+  - Directory path normalization: `.` and `./` are mapped to `""` so default directory listings succeed under OpenVMS syntax.
+- **Graceful environment fallback**: When connection arguments are omitted from a tool call, the server falls back to environment variables (`FTP_HOST`, `FTP_PORT`, `FTP_USER`, etc.), preserving full backward compatibility with single-host configurations.
+
 ## 1.2.2 — 2026-09-10
 
 ### Fixed

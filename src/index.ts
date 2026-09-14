@@ -25,14 +25,70 @@ function resolveProtocol(raw: string | undefined): ConnectionType {
   );
 }
 
-// Client initialized inside main() so decryption/config errors are caught gracefully
+// Global default configuration from environment
+let defaultProtocol = ConnectionType.FTP;
+let defaultHost = "localhost";
+let defaultUser = "anonymous";
+let defaultPassword = "";
+let defaultFtpPort = 21;
+let defaultSftpPort = 22;
+let defaultSecure = false;
+let defaultPassphrase = "";
+let defaultPrivateKeyPath = "";
+
+// Common connection parameters schema for all tools
+const connectionParamsSchema = {
+  host: z.string().optional().describe("Server hostname or IP address (falls back to FTP_HOST env var)"),
+  port: z.number().int().optional().describe("Server port (default: 21 for FTP, 22 for SFTP, or FTP_PORT env var)"),
+  protocol: z.enum(["ftp", "sftp"]).optional().describe("Protocol: 'ftp' or 'sftp' (default: 'ftp', or FTP_PROTOCOL env var)"),
+  user: z.string().optional().describe("Username for authentication (falls back to FTP_USER env var)"),
+  password: z.string().optional().describe("Password for authentication (falls back to FTP_PASSWORD env var)"),
+  secure: z.boolean().optional().describe("Enable FTPS / TLS (default: false, or FTP_SECURE env var)"),
+};
+
+interface ConnectionArgs {
+  host?: string;
+  port?: number;
+  protocol?: "ftp" | "sftp";
+  user?: string;
+  password?: string;
+  secure?: boolean;
+}
+
 type AnyFtpClient = FtpClient | SftpClient;
-let ftpClient: AnyFtpClient;
+
+function getClient(conn: ConnectionArgs): AnyFtpClient {
+  const protocol = conn.protocol ? resolveProtocol(conn.protocol) : defaultProtocol;
+  const host = conn.host || defaultHost;
+  const user = conn.user !== undefined ? decrypt(conn.user) : defaultUser;
+  const password = conn.password !== undefined ? decrypt(conn.password) : defaultPassword;
+
+  if (protocol === ConnectionType.SFTP) {
+    const sftpConfig: SftpConfig = {
+      host,
+      port: conn.port ?? defaultSftpPort,
+      user,
+      password,
+      passphrase: defaultPassphrase,
+      privateKeyPath: defaultPrivateKeyPath,
+    };
+    return new SftpClient(sftpConfig);
+  } else {
+    const ftpConfig: FtpConfig = {
+      host,
+      port: conn.port ?? defaultFtpPort,
+      user,
+      password,
+      secure: conn.secure !== undefined ? conn.secure : defaultSecure,
+    };
+    return new FtpClient(ftpConfig);
+  }
+}
 
 // Create server instance
 const server = new McpServer({
   name: "mcp-server-ftp",
-  version: "1.2.2",
+  version: "1.3.0",
 });
 
 // The MCP SDK dispatches tool calls concurrently, but concurrent FTP operations
@@ -68,15 +124,17 @@ server.registerTool(
   "list-directory",
   {
     title: "List Directory",
-    description: "List contents of an FTP directory",
+    description: "List contents of an FTP/SFTP directory. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory on the FTP server"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath }) => {
+  serialized(async ({ remotePath, ...conn }) => {
     try {
-      const listing = await ftpClient.listDirectory(remotePath);
+      const client = getClient(conn);
+      const listing = await client.listDirectory(remotePath);
 
       // Format the output
       const formatted = listing.map((item) =>
@@ -113,15 +171,17 @@ server.registerTool(
   "download-file",
   {
     title: "Download File",
-    description: "Download a file from the FTP server. Text files are returned as-is; binary files are returned base64-encoded.",
+    description: "Download a file from the FTP/SFTP server. Text files are returned as-is; binary files are returned base64-encoded. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath }) => {
+  serialized(async ({ remotePath, ...conn }) => {
     try {
-      const { content, encoding } = await ftpClient.downloadFile(remotePath);
+      const client = getClient(conn);
+      const { content, encoding } = await client.downloadFile(remotePath);
 
       const header = encoding === "base64"
         ? `File content of ${remotePath} (binary, base64-encoded):`
@@ -147,18 +207,20 @@ server.registerTool(
   "upload-file",
   {
     title: "Upload File",
-    description: "Upload a file to the FTP server. Pass encoding \"base64\" to upload binary content.",
+    description: "Upload a file to the FTP/SFTP server. Pass encoding \"base64\" to upload binary content. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Destination path on the FTP server"),
       content: z.string().describe("Content to upload to the file"),
       encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8)"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath, content, encoding }) => {
+  serialized(async ({ remotePath, content, encoding, ...conn }) => {
     try {
+      const client = getClient(conn);
       const enc = encoding ?? "utf8";
-      await ftpClient.uploadFile(remotePath, content, enc);
+      await client.uploadFile(remotePath, content, enc);
 
       return {
         content: [
@@ -180,15 +242,17 @@ server.registerTool(
   "create-directory",
   {
     title: "Create Directory",
-    description: "Create a new directory on the FTP server",
+    description: "Create a new directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory to create"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath }) => {
+  serialized(async ({ remotePath, ...conn }) => {
     try {
-      await ftpClient.createDirectory(remotePath);
+      const client = getClient(conn);
+      await client.createDirectory(remotePath);
 
       return {
         content: [
@@ -210,15 +274,17 @@ server.registerTool(
   "delete-file",
   {
     title: "Delete File",
-    description: "Delete a file from the FTP server",
+    description: "Delete a file from the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file to delete"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath }) => {
+  serialized(async ({ remotePath, ...conn }) => {
     try {
-      await ftpClient.deleteFile(remotePath);
+      const client = getClient(conn);
+      await client.deleteFile(remotePath);
 
       return {
         content: [
@@ -240,15 +306,17 @@ server.registerTool(
   "delete-directory",
   {
     title: "Delete Directory",
-    description: "Delete a directory from the FTP server",
+    description: "Delete a directory from the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory to delete"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath }) => {
+  serialized(async ({ remotePath, ...conn }) => {
     try {
-      await ftpClient.deleteDirectory(remotePath);
+      const client = getClient(conn);
+      await client.deleteDirectory(remotePath);
 
       return {
         content: [
@@ -270,16 +338,18 @@ server.registerTool(
   "rename-file",
   {
     title: "Rename / Move",
-    description: "Rename or move a file or directory on the FTP server",
+    description: "Rename or move a file or directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       fromPath: z.string().describe("Current path of the file or directory"),
       toPath: z.string().describe("New path for the file or directory"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
-  serialized(async ({ fromPath, toPath }) => {
+  serialized(async ({ fromPath, toPath, ...conn }) => {
     try {
-      await ftpClient.rename(fromPath, toPath);
+      const client = getClient(conn);
+      await client.rename(fromPath, toPath);
 
       return {
         content: [
@@ -301,16 +371,17 @@ server.registerTool(
   "edit-file",
   {
     title: "Edit File",
-    description: "Edit a text file on the FTP server by replacing an exact string, without re-uploading the whole file content. oldText must match exactly (including whitespace) and be unique in the file unless replaceAll is set.",
+    description: "Edit a text file on the FTP/SFTP server by replacing an exact string, without re-uploading the whole file content. oldText must match exactly (including whitespace) and be unique in the file unless replaceAll is set. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
       oldText: z.string().describe("Exact text to find in the file"),
       newText: z.string().describe("Text to replace it with"),
       replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring oldText to be unique (default: false)"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
-  serialized(async ({ remotePath, oldText, newText, replaceAll }) => {
+  serialized(async ({ remotePath, oldText, newText, replaceAll, ...conn }) => {
     try {
       if (oldText === "") {
         return errorResult("Error editing file", new Error("oldText must not be empty"));
@@ -319,7 +390,8 @@ server.registerTool(
         return errorResult("Error editing file", new Error("oldText and newText are identical; nothing to change"));
       }
 
-      const { content, encoding } = await ftpClient.downloadFile(remotePath);
+      const client = getClient(conn);
+      const { content, encoding } = await client.downloadFile(remotePath);
       if (encoding === "base64") {
         return errorResult(
           "Error editing file",
@@ -342,7 +414,7 @@ server.registerTool(
       }
 
       const updated = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
-      await ftpClient.uploadFile(remotePath, updated, "utf8");
+      await client.uploadFile(remotePath, updated, "utf8");
       const fileSize = Buffer.byteLength(updated, "utf8");
 
       return {
@@ -365,18 +437,20 @@ server.registerTool(
   "append-file",
   {
     title: "Append to File",
-    description: "Append content to the end of a file on the FTP server (creates the file if it does not exist). Pass encoding \"base64\" for binary content.",
+    description: "Append content to the end of a file on the FTP/SFTP server (creates the file if it does not exist). Pass encoding \"base64\" for binary content. Optionally specify host, port, protocol, user, and password per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
       content: z.string().describe("Content to append to the file"),
       encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8)"),
+      ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
-  serialized(async ({ remotePath, content, encoding }) => {
+  serialized(async ({ remotePath, content, encoding, ...conn }) => {
     try {
+      const client = getClient(conn);
       const enc = encoding ?? "utf8";
-      await ftpClient.appendFile(remotePath, content, enc);
+      await client.appendFile(remotePath, content, enc);
       const appendedBytes = Buffer.byteLength(content, enc);
 
       return {
@@ -407,42 +481,25 @@ async function main() {
   // Load encryption key from OS keychain before decrypting any credentials
   await loadEncryptionKey();
   try {
-    const protocol = resolveProtocol(process.env.FTP_PROTOCOL);
-    const host = process.env.FTP_HOST || "localhost";
-    const user = decrypt(process.env.FTP_USER || "anonymous");
-    const password = decrypt(process.env.FTP_PASSWORD || "");
-
-    if (protocol === ConnectionType.SFTP) {
-      const passphrase = decrypt(process.env.FTP_PASSPHRASE || "");
-      const sftpConfig: SftpConfig = {
-        host,
-        port: parseInt(process.env.FTP_PORT || "22", 10),
-        user,
-        password,
-        passphrase,
-        privateKeyPath: process.env.FTP_PRIVATE_KEY_PATH || "",
-      };
-      ftpClient = new SftpClient(sftpConfig);
-    } else {
-      const ftpConfig: FtpConfig = {
-        host,
-        port: parseInt(process.env.FTP_PORT || "21", 10),
-        user,
-        password,
-        secure: resolveSecure(process.env.FTP_SECURE),
-      };
-      ftpClient = new FtpClient(ftpConfig);
-    }
+    defaultProtocol = resolveProtocol(process.env.FTP_PROTOCOL);
+    defaultHost = process.env.FTP_HOST || "localhost";
+    defaultUser = decrypt(process.env.FTP_USER || "anonymous");
+    defaultPassword = decrypt(process.env.FTP_PASSWORD || "");
+    defaultFtpPort = parseInt(process.env.FTP_PORT || "21", 10);
+    defaultSftpPort = parseInt(process.env.FTP_PORT || "22", 10);
+    defaultSecure = resolveSecure(process.env.FTP_SECURE);
+    defaultPassphrase = decrypt(process.env.FTP_PASSPHRASE || "");
+    defaultPrivateKeyPath = process.env.FTP_PRIVATE_KEY_PATH || "";
   } catch (error) {
     console.error(
-      "Failed to initialize connection config:",
+      "Failed to initialize default connection config:",
       error instanceof Error ? error.message : String(error)
     );
     process.exit(1);
   }
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("FTP MCP Server running on stdio");
+  console.error("FTP MCP Server v1.3.0 running on stdio");
 }
 
 main().catch((error) => {

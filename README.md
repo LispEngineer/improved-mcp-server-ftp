@@ -20,6 +20,8 @@ This Model Context Protocol (MCP) server provides file-management tools for FTP,
 - Append to files
 - Rename or move files/directories
 - Create and delete directories
+- Dynamic per-transaction connection parameters (`host`, `port`, `protocol`, `user`, `password`, `secure`)
+- OpenVMS TCP/IP Services FTP support (OpenVMS directory parser and versioned deletion)
 - FTP, FTPS, and SFTP support
 - SFTP password or SSH private-key authentication
 - Optional 1Password CLI private-key resolution
@@ -238,6 +240,44 @@ npm run encrypt-env -- <plaintext-value>
 
 Tool calls return machine-readable `structuredContent`, and all nine tools advertise output schemas. Version 1.2.2 includes a compatibility shim that ensures advertised schemas use the JSON Schema 2020-12 dialect required by current MCP clients.
 
+## Dynamic connection parameters (multi-host targeting)
+
+Starting in version 1.3.0, AI agents can pass connection parameters directly in any tool call. This allows a single MCP server instance to interact with multiple FTP/SFTP hosts dynamically without requiring separate server configurations.
+
+### Supported transaction parameters
+
+| Parameter | Type | Description | Default |
+|---|---|---|---|
+| `host` | `string` | Target server hostname or IP address | `FTP_HOST` env var or `localhost` |
+| `port` | `integer` | Port number | `FTP_PORT` env var or `21` (FTP) / `22` (SFTP) |
+| `protocol` | `string` | `"ftp"` or `"sftp"` | `FTP_PROTOCOL` env var or `"ftp"` |
+| `user` | `string` | Username for authentication | `FTP_USER` env var or `"anonymous"` |
+| `password` | `string` | Password for authentication | `FTP_PASSWORD` env var or empty |
+| `secure` | `boolean` | Enable FTPS / TLS (FTP only) | `FTP_SECURE` env var or `false` |
+
+If any parameter is omitted from a tool call, the server automatically falls back to the corresponding environment variable or default, preserving full backward compatibility with single-host configurations.
+
+### Dynamic tool call example
+
+```json
+{
+  "name": "list-directory",
+  "arguments": {
+    "host": "192.168.3.201",
+    "user": "USER1",
+    "password": "user1pass",
+    "remotePath": ""
+  }
+}
+```
+
+## OpenVMS Support
+
+Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
+- **Directory listing parser**: Dedicated fallback parser for OpenVMS `LIST` output (`FILENAME.EXT;VER`, 512-byte blocks, ISO date conversion, `*.DIR;*` subdirectories, and 2-line wrapped entries).
+- **Versioned deletion**: Automatically retries unversioned deletions with `;0` (latest version) when OpenVMS requires a version specification.
+- **Path normalization**: Translates `.` and `./` to `""` for current-directory listings.
+
 ## Security notes
 
 - Prefer SFTP when available; it uses SSH encryption and key authentication without FTPS certificate configuration.
@@ -251,6 +291,12 @@ Tool calls return machine-readable `structuredContent`, and all nine tools adver
 2. Run `npm install`.
 3. Run `npm run build` or `npx tsc`.
 4. Start the compiled server with `node build/index.js`.
+
+## Credits and Authorship
+
+- **Original Author**: [alxspiker](https://github.com/alxspiker) (https://github.com/alxspiker/mcp-server-ftp)
+- **Contributors**:
+  - **Douglas P. Fields, Jr.** (`symbolics@lisp.engineer`): Version 1.3.0 — Dynamic per-transaction host and credential parameters, OpenVMS directory listing parser, OpenVMS versioned deletion semantics, and graceful environment fallback.
 
 ## License
 
