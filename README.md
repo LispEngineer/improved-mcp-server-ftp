@@ -1,3 +1,14 @@
+# Improved MCP Server for FTP
+
+Improvements:
+
+* Support per-connection destination and credentials
+* Support VMS conventions
+
+Improver: Douglas P. Fields, Jr. with Gemini 3.8 Flash
+
+---
+
 [![MseeP.ai Security Assessment Badge](https://mseep.net/pr/alxspiker-mcp-server-ftp-badge.png)](https://mseep.ai/app/alxspiker-mcp-server-ftp)
 
 # MCP Server for FTP, FTPS, and SFTP Access
