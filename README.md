@@ -4,8 +4,10 @@ Improvements:
 
 * Support per-connection destination and credentials
 * Support VMS conventions
+* Persistent transfer audit logging (`ftp_transfers.log`) with timestamps, file 
+  sizes, transfer durations, and SHA-256 integrity hashes
 
-Improver: Douglas P. Fields, Jr. with Gemini 3.8 Flash
+Improver: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`) with Gemini 3.8 Flash
 
 ---
 
@@ -31,7 +33,9 @@ This Model Context Protocol (MCP) server provides file-management tools for FTP,
 - Append to files
 - Rename or move files/directories
 - Create and delete directories
-- Dynamic per-transaction connection parameters (`host`, `port`, `protocol`, `user`, `password`, `secure`)
+- Dynamic per-transaction connection parameters (`host`, `port`, `protocol`, `user`, `password`, `secure`, `log_dir`)
+- Permanent transfer audit logging (`ftp_transfers.log`) with timestamps, file sizes, SHA-256 integrity hashes, and duration metrics
+- Flexible log directory resolution (`log_dir` parameter, `FTP_LOG_DIR`, `TELNET_LOG_DIR`, `SERIAL_LOG_DIR`, `./logs`, or `~/.mcp-ftp-logs`)
 - OpenVMS TCP/IP Services FTP support (OpenVMS directory parser and versioned deletion)
 - FTP, FTPS, and SFTP support
 - SFTP password or SSH private-key authentication
@@ -160,6 +164,7 @@ FTPS uses the normal FTP client with TLS enabled:
 | `FTP_PRIVATE_KEY_PATH` | SFTP only | SSH private-key path or `op://` 1Password secret reference | auto-detect |
 | `FTP_PASSPHRASE` | SFTP only | SSH private-key passphrase; supports encrypted `enc:` values | empty |
 | `FTP_ENCRYPTION_KEY` | encrypted credentials | 64-character hex AES-256 key. Prefer the OS keychain or a global environment variable for local installs. | disabled |
+| `FTP_LOG_DIR` | all | Directory path for persistent `ftp_transfers.log` audit log | `TELNET_LOG_DIR`, `./logs` (if present), or `~/.mcp-ftp-logs` |
 
 ## SFTP authentication
 
@@ -265,6 +270,7 @@ Starting in version 1.3.0, AI agents can pass connection parameters directly in 
 | `user` | `string` | Username for authentication | `FTP_USER` env var or `"anonymous"` |
 | `password` | `string` | Password for authentication | `FTP_PASSWORD` env var or empty |
 | `secure` | `boolean` | Enable FTPS / TLS (FTP only) | `FTP_SECURE` env var or `false` |
+| `log_dir` | `string` | Target directory for transfer audit log (`ftp_transfers.log`) | `FTP_LOG_DIR` env var or smart fallback |
 
 If any parameter is omitted from a tool call, the server automatically falls back to the corresponding environment variable or default, preserving full backward compatibility with single-host configurations.
 
@@ -281,6 +287,46 @@ If any parameter is omitted from a tool call, the server automatically falls bac
   }
 }
 ```
+
+## Transfer Logging
+
+Starting in version 1.4.0, all file operations (`upload-file`, `download-file`, `append-file`, `edit-file`, and `delete-file`) are permanently recorded to a transfer audit log (`ftp_transfers.log`), modeled after the session logging mechanism in `chuk-mcp-telnet-client`.
+
+### Logged metadata
+Each transfer event records a structured human-readable block containing:
+- **ISO-8601 Timestamp** of the operation
+- **Operation type & status** (`UPLOAD`, `DOWNLOAD`, `APPEND`, `EDIT`, `DELETE` — `SUCCESS` or `FAILED`)
+- **Target host, port, protocol, and username**
+- **Remote file path**
+- **File size** in bytes and human-readable units (B, KB, MB, GB)
+- **SHA-256 integrity hash** computed automatically from the transferred or modified payload
+- **Transfer duration** (in milliseconds) and effective transfer speed (e.g. `KB/s`)
+- **Error details** if the operation failed
+
+### Example log entry
+```text
+================================================================================
+[2026-09-14T19:15:30.123Z] FTP TRANSFER: UPLOAD - SUCCESS
+Target       : 192.168.3.204:21 (USER1)
+Protocol     : FTP
+Remote Path  : TEST_LOG.TXT
+Size         : 42 B (42 bytes)
+Encoding     : utf8
+SHA-256      : a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e
+Duration     : 145 ms (289.66 B/s)
+================================================================================
+```
+
+### Log directory resolution
+The logger resolves the destination log directory in the following priority:
+1. Per-tool `log_dir` parameter passed directly in the tool call.
+2. `FTP_LOG_DIR` environment variable.
+3. `TELNET_LOG_DIR` or `SERIAL_LOG_DIR` environment variable (for project-wide session logging compatibility).
+4. `./logs` directory in the current working directory, if it exists.
+5. Default global fallback: `~/.mcp-ftp-logs`.
+
+### Programmatic tool response
+All transfer tools return `logFile` (the absolute path to `ftp_transfers.log`) and `durationMs` inside their `structuredContent` payload, allowing AI agents to confirm logging and verify transfer integrity.
 
 ## OpenVMS Support
 
@@ -307,7 +353,9 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
 
 - **Original Author**: [alxspiker](https://github.com/alxspiker) (https://github.com/alxspiker/mcp-server-ftp)
 - **Contributors**:
-  - **Douglas P. Fields, Jr.** (`symbolics@lisp.engineer`): Version 1.3.0 — Dynamic per-transaction host and credential parameters, OpenVMS directory listing parser, OpenVMS versioned deletion semantics, and graceful environment fallback.
+  - **Douglas P. Fields, Jr.** (`symbolics@lisp.engineer`):
+    - Version 1.3.0 — Dynamic per-transaction host and credential parameters, OpenVMS directory listing parser, OpenVMS versioned deletion semantics, and graceful environment fallback.
+    - Version 1.4.0 — Persistent transfer audit logging (`ftp_transfers.log`) with ISO timestamps, file sizes, SHA-256 integrity hashes, transfer rate metrics, and configurable log directories mirroring the Telnet/Serial MCP architecture.
 
 ## License
 

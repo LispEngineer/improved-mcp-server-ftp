@@ -7,6 +7,7 @@ import { SftpClient, SftpConfig } from "./sftp-client.js";
 import { decrypt } from "./crypto.js";
 import { ConnectionType } from "./connection-type.js";
 import { loadEncryptionKey } from "./keychain.js";
+import { TransferLogger, formatBytes } from "./logger.js";
 
 function resolveSecure(raw: string | undefined): boolean {
   const v = raw?.trim().toLowerCase();
@@ -44,6 +45,7 @@ const connectionParamsSchema = {
   user: z.string().optional().describe("Username for authentication (falls back to FTP_USER env var)"),
   password: z.string().optional().describe("Password for authentication (falls back to FTP_PASSWORD env var)"),
   secure: z.boolean().optional().describe("Enable FTPS / TLS (default: false, or FTP_SECURE env var)"),
+  log_dir: z.string().optional().describe("Directory for transfer log files (defaults to FTP_LOG_DIR, TELNET_LOG_DIR, or ./logs)"),
 };
 
 interface ConnectionArgs {
@@ -53,42 +55,57 @@ interface ConnectionArgs {
   user?: string;
   password?: string;
   secure?: boolean;
+  log_dir?: string;
 }
 
 type AnyFtpClient = FtpClient | SftpClient;
 
-function getClient(conn: ConnectionArgs): AnyFtpClient {
+interface ResolvedConnection {
+  client: AnyFtpClient;
+  host: string;
+  port: number;
+  protocol: ConnectionType;
+  user: string;
+  logger: TransferLogger;
+}
+
+function resolveConnection(conn: ConnectionArgs): ResolvedConnection {
   const protocol = conn.protocol ? resolveProtocol(conn.protocol) : defaultProtocol;
   const host = conn.host || defaultHost;
   const user = conn.user !== undefined ? decrypt(conn.user) : defaultUser;
   const password = conn.password !== undefined ? decrypt(conn.password) : defaultPassword;
+  const port = conn.port ?? (protocol === ConnectionType.SFTP ? defaultSftpPort : defaultFtpPort);
+  const logger = new TransferLogger(conn.log_dir);
 
+  let client: AnyFtpClient;
   if (protocol === ConnectionType.SFTP) {
     const sftpConfig: SftpConfig = {
       host,
-      port: conn.port ?? defaultSftpPort,
+      port,
       user,
       password,
       passphrase: defaultPassphrase,
       privateKeyPath: defaultPrivateKeyPath,
     };
-    return new SftpClient(sftpConfig);
+    client = new SftpClient(sftpConfig);
   } else {
     const ftpConfig: FtpConfig = {
       host,
-      port: conn.port ?? defaultFtpPort,
+      port,
       user,
       password,
       secure: conn.secure !== undefined ? conn.secure : defaultSecure,
     };
-    return new FtpClient(ftpConfig);
+    client = new FtpClient(ftpConfig);
   }
+
+  return { client, host, port, protocol, user, logger };
 }
 
 // Create server instance
 const server = new McpServer({
   name: "mcp-server-ftp",
-  version: "1.3.0",
+  version: "1.4.0",
 });
 
 // The MCP SDK dispatches tool calls concurrently, but concurrent FTP operations
@@ -124,7 +141,7 @@ server.registerTool(
   "list-directory",
   {
     title: "List Directory",
-    description: "List contents of an FTP/SFTP directory. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "List contents of an FTP/SFTP directory. Optionally specify host, port, protocol, user, password, and log_dir per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory on the FTP server"),
       ...connectionParamsSchema,
@@ -132,13 +149,13 @@ server.registerTool(
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, ...conn }) => {
+    const { client } = resolveConnection(conn);
     try {
-      const client = getClient(conn);
       const listing = await client.listDirectory(remotePath);
 
       // Format the output
       const formatted = listing.map((item) =>
-        `${item.type === "directory" ? "[DIR]" : "[FILE]"} ${item.name} ${item.type === "file" ? `(${formatSize(item.size)})` : ""} - ${item.modifiedDate}`
+        `${item.type === "directory" ? "[DIR]" : "[FILE]"} ${item.name} ${item.type === "file" ? `(${formatBytes(item.size)})` : ""} - ${item.modifiedDate}`
       ).join("\n");
 
       const directoryCount = listing.filter(i => i.type === "directory").length;
@@ -171,7 +188,7 @@ server.registerTool(
   "download-file",
   {
     title: "Download File",
-    description: "Download a file from the FTP/SFTP server. Text files are returned as-is; binary files are returned base64-encoded. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Download a file from the FTP/SFTP server. Text files are returned as-is; binary files are returned base64-encoded. Transferred file metadata is permanently logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
       ...connectionParamsSchema,
@@ -179,13 +196,30 @@ server.registerTool(
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, ...conn }) => {
+    const { client, host, port, protocol, user, logger } = resolveConnection(conn);
+    const t0 = Date.now();
     try {
-      const client = getClient(conn);
       const { content, encoding } = await client.downloadFile(remotePath);
+      const durationMs = Date.now() - t0;
+      const sizeBytes = Buffer.byteLength(content, encoding);
+
+      const logFile = logger.logTransfer({
+        operation: "DOWNLOAD",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes,
+        encoding,
+        content,
+        durationMs,
+        status: "SUCCESS",
+      });
 
       const header = encoding === "base64"
-        ? `File content of ${remotePath} (binary, base64-encoded):`
-        : `File content of ${remotePath}:`;
+        ? `File content of ${remotePath} (binary, base64-encoded, ${formatBytes(sizeBytes)}):`
+        : `File content of ${remotePath} (${formatBytes(sizeBytes)}):`;
 
       return {
         content: [
@@ -194,9 +228,21 @@ server.registerTool(
             text: `${header}\n\n${content}`
           }
         ],
-        structuredContent: { remotePath, content, encoding },
+        structuredContent: { remotePath, content, encoding, sizeBytes, durationMs, logFile },
       };
     } catch (error) {
+      const durationMs = Date.now() - t0;
+      logger.logTransfer({
+        operation: "DOWNLOAD",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        durationMs,
+        status: "FAILED",
+        error: error instanceof Error ? error.message : String(error),
+      });
       return errorResult("Error downloading file", error);
     }
   })
@@ -207,7 +253,7 @@ server.registerTool(
   "upload-file",
   {
     title: "Upload File",
-    description: "Upload a file to the FTP/SFTP server. Pass encoding \"base64\" to upload binary content. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Upload a file to the FTP/SFTP server. Pass encoding \"base64\" to upload binary content. Transferred file metadata is permanently logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Destination path on the FTP server"),
       content: z.string().describe("Content to upload to the file"),
@@ -217,21 +263,53 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, content, encoding, ...conn }) => {
+    const { client, host, port, protocol, user, logger } = resolveConnection(conn);
+    const t0 = Date.now();
+    const enc = encoding ?? "utf8";
+    const sizeBytes = Buffer.byteLength(content, enc);
     try {
-      const client = getClient(conn);
-      const enc = encoding ?? "utf8";
       await client.uploadFile(remotePath, content, enc);
+      const durationMs = Date.now() - t0;
+
+      const logFile = logger.logTransfer({
+        operation: "UPLOAD",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes,
+        encoding: enc,
+        content,
+        durationMs,
+        status: "SUCCESS",
+      });
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `File successfully uploaded to ${remotePath}`
+            text: `File successfully uploaded to ${remotePath} (${formatBytes(sizeBytes)}, logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, bytesWritten: Buffer.byteLength(content, enc) },
+        structuredContent: { remotePath, bytesWritten: sizeBytes, durationMs, logFile },
       };
     } catch (error) {
+      const durationMs = Date.now() - t0;
+      logger.logTransfer({
+        operation: "UPLOAD",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes,
+        encoding: enc,
+        content,
+        durationMs,
+        status: "FAILED",
+        error: error instanceof Error ? error.message : String(error),
+      });
       return errorResult("Error uploading file", error);
     }
   })
@@ -242,7 +320,7 @@ server.registerTool(
   "create-directory",
   {
     title: "Create Directory",
-    description: "Create a new directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Create a new directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, password, and log_dir per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory to create"),
       ...connectionParamsSchema,
@@ -250,8 +328,8 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, ...conn }) => {
+    const { client } = resolveConnection(conn);
     try {
-      const client = getClient(conn);
       await client.createDirectory(remotePath);
 
       return {
@@ -274,7 +352,7 @@ server.registerTool(
   "delete-file",
   {
     title: "Delete File",
-    description: "Delete a file from the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Delete a file from the FTP/SFTP server. Deletions are logged with timestamps to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file to delete"),
       ...connectionParamsSchema,
@@ -282,20 +360,45 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, ...conn }) => {
+    const { client, host, port, protocol, user, logger } = resolveConnection(conn);
+    const t0 = Date.now();
     try {
-      const client = getClient(conn);
       await client.deleteFile(remotePath);
+      const durationMs = Date.now() - t0;
+
+      const logFile = logger.logTransfer({
+        operation: "DELETE",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        durationMs,
+        status: "SUCCESS",
+      });
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `File successfully deleted from ${remotePath}`
+            text: `File successfully deleted from ${remotePath} (logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, deleted: true },
+        structuredContent: { remotePath, deleted: true, durationMs, logFile },
       };
     } catch (error) {
+      const durationMs = Date.now() - t0;
+      logger.logTransfer({
+        operation: "DELETE",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        durationMs,
+        status: "FAILED",
+        error: error instanceof Error ? error.message : String(error),
+      });
       return errorResult("Error deleting file", error);
     }
   })
@@ -306,7 +409,7 @@ server.registerTool(
   "delete-directory",
   {
     title: "Delete Directory",
-    description: "Delete a directory from the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Delete a directory from the FTP/SFTP server. Optionally specify host, port, protocol, user, password, and log_dir per transaction.",
     inputSchema: {
       remotePath: z.string().describe("Path of the directory to delete"),
       ...connectionParamsSchema,
@@ -314,8 +417,8 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   serialized(async ({ remotePath, ...conn }) => {
+    const { client } = resolveConnection(conn);
     try {
-      const client = getClient(conn);
       await client.deleteDirectory(remotePath);
 
       return {
@@ -338,7 +441,7 @@ server.registerTool(
   "rename-file",
   {
     title: "Rename / Move",
-    description: "Rename or move a file or directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Rename or move a file or directory on the FTP/SFTP server. Optionally specify host, port, protocol, user, password, and log_dir per transaction.",
     inputSchema: {
       fromPath: z.string().describe("Current path of the file or directory"),
       toPath: z.string().describe("New path for the file or directory"),
@@ -347,8 +450,8 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   serialized(async ({ fromPath, toPath, ...conn }) => {
+    const { client } = resolveConnection(conn);
     try {
-      const client = getClient(conn);
       await client.rename(fromPath, toPath);
 
       return {
@@ -371,7 +474,7 @@ server.registerTool(
   "edit-file",
   {
     title: "Edit File",
-    description: "Edit a text file on the FTP/SFTP server by replacing an exact string, without re-uploading the whole file content. oldText must match exactly (including whitespace) and be unique in the file unless replaceAll is set. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Edit a text file on the FTP/SFTP server by replacing an exact string, without re-uploading the whole file content. oldText must match exactly (including whitespace) and be unique in the file unless replaceAll is set. File edits are logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
       oldText: z.string().describe("Exact text to find in the file"),
@@ -382,6 +485,8 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   serialized(async ({ remotePath, oldText, newText, replaceAll, ...conn }) => {
+    const { client, host, port, protocol, user, logger } = resolveConnection(conn);
+    const t0 = Date.now();
     try {
       if (oldText === "") {
         return errorResult("Error editing file", new Error("oldText must not be empty"));
@@ -390,7 +495,6 @@ server.registerTool(
         return errorResult("Error editing file", new Error("oldText and newText are identical; nothing to change"));
       }
 
-      const client = getClient(conn);
       const { content, encoding } = await client.downloadFile(remotePath);
       if (encoding === "base64") {
         return errorResult(
@@ -416,17 +520,45 @@ server.registerTool(
       const updated = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
       await client.uploadFile(remotePath, updated, "utf8");
       const fileSize = Buffer.byteLength(updated, "utf8");
+      const durationMs = Date.now() - t0;
+
+      const logFile = logger.logTransfer({
+        operation: "EDIT",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes: fileSize,
+        encoding: "utf8",
+        content: updated,
+        durationMs,
+        status: "SUCCESS",
+        details: { replacements: occurrences, oldTextLength: oldText.length, newTextLength: newText.length },
+      });
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `Successfully edited ${remotePath}: replaced ${occurrences} occurrence${occurrences === 1 ? "" : "s"} (file is now ${formatSize(fileSize)})`
+            text: `Successfully edited ${remotePath}: replaced ${occurrences} occurrence${occurrences === 1 ? "" : "s"} (file is now ${formatBytes(fileSize)}, logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, replacements: occurrences, fileSize },
+        structuredContent: { remotePath, replacements: occurrences, fileSize, durationMs, logFile },
       };
     } catch (error) {
+      const durationMs = Date.now() - t0;
+      logger.logTransfer({
+        operation: "EDIT",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        durationMs,
+        status: "FAILED",
+        error: error instanceof Error ? error.message : String(error),
+      });
       return errorResult("Error editing file", error);
     }
   })
@@ -437,7 +569,7 @@ server.registerTool(
   "append-file",
   {
     title: "Append to File",
-    description: "Append content to the end of a file on the FTP/SFTP server (creates the file if it does not exist). Pass encoding \"base64\" for binary content. Optionally specify host, port, protocol, user, and password per transaction.",
+    description: "Append content to the end of a file on the FTP/SFTP server (creates the file if it does not exist). Pass encoding \"base64\" for binary content. File appends are logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
       content: z.string().describe("Content to append to the file"),
@@ -447,34 +579,57 @@ server.registerTool(
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   serialized(async ({ remotePath, content, encoding, ...conn }) => {
+    const { client, host, port, protocol, user, logger } = resolveConnection(conn);
+    const t0 = Date.now();
+    const enc = encoding ?? "utf8";
+    const sizeBytes = Buffer.byteLength(content, enc);
     try {
-      const client = getClient(conn);
-      const enc = encoding ?? "utf8";
       await client.appendFile(remotePath, content, enc);
-      const appendedBytes = Buffer.byteLength(content, enc);
+      const durationMs = Date.now() - t0;
+
+      const logFile = logger.logTransfer({
+        operation: "APPEND",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes,
+        encoding: enc,
+        content,
+        durationMs,
+        status: "SUCCESS",
+      });
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `Successfully appended ${formatSize(appendedBytes)} to ${remotePath}`
+            text: `Successfully appended ${formatBytes(sizeBytes)} to ${remotePath} (logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, appendedBytes },
+        structuredContent: { remotePath, appendedBytes: sizeBytes, durationMs, logFile },
       };
     } catch (error) {
+      const durationMs = Date.now() - t0;
+      logger.logTransfer({
+        operation: "APPEND",
+        host,
+        port,
+        protocol,
+        user,
+        remotePath,
+        sizeBytes,
+        encoding: enc,
+        content,
+        durationMs,
+        status: "FAILED",
+        error: error instanceof Error ? error.message : String(error),
+      });
       return errorResult("Error appending to file", error);
     }
   })
 );
-
-// Helper function to format file sizes
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return bytes + " B";
-  else if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB";
-  else if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
-  else return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
-}
 
 // Initialize and run the server
 async function main() {
@@ -499,7 +654,10 @@ async function main() {
   }
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("FTP MCP Server v1.3.0 running on stdio");
+  const defaultLogger = new TransferLogger();
+  console.error(
+    `FTP MCP Server v1.4.0 running on stdio (log directory: ${defaultLogger.getLogDir()})`
+  );
 }
 
 main().catch((error) => {

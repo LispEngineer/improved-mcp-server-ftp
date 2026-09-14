@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.0 — 2026-09-14
+**Contributors**: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`)
+
+### Added
+- **Permanent transfer audit logging (`ftp_transfers.log`)**:
+  - Implemented `TransferLogger` to record all file transfers and modifications (`UPLOAD`, `DOWNLOAD`, `APPEND`, `EDIT`, `DELETE`) with ISO-8601 timestamps, target host and port, username, protocol, remote file path, file size in bytes, transfer duration, transfer rate, and execution status (`SUCCESS` / `FAILED`).
+  - Added cryptographic integrity hashing: automatically calculates and logs SHA-256 digests for all uploaded, downloaded, appended, and edited file payloads.
+  - Added smart log directory resolution: checks `FTP_LOG_DIR`, `TELNET_LOG_DIR`, `SERIAL_LOG_DIR`, `./logs` in current workspace, or `~/.mcp-ftp-logs`. Also accepts per-transaction `log_dir` override.
+  - Returned `logFile` path and `durationMs` in tool `structuredContent` across all transfer tools for programmatic consumption by AI agents.
+
 ## 1.3.0 — 2026-09-13
 **Contributors**: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`)
 
