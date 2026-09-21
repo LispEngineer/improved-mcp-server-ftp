@@ -8,6 +8,7 @@ import { decrypt } from "./crypto.js";
 import { ConnectionType } from "./connection-type.js";
 import { loadEncryptionKey } from "./keychain.js";
 import { TransferLogger, formatBytes } from "./logger.js";
+import { SFTP_ASCII_MESSAGE, TransferMode, resolveLocalPath } from "./transfer.js";
 
 function resolveSecure(raw: string | undefined): boolean {
   const v = raw?.trim().toLowerCase();
@@ -60,6 +61,44 @@ interface ConnectionArgs {
 
 type AnyFtpClient = FtpClient | SftpClient;
 
+// Shared parameters and checks for the tools that move file bytes (download-file, upload-file, append-file)
+const transferModeSchema = z
+  .enum(["binary", "ascii"])
+  .optional()
+  .describe(
+    "FTP data type (default: binary). 'binary' is byte-exact (archives, images, savesets). 'ascii' sends TYPE A: local LF becomes CR LF on upload and CR LF becomes LF on download, which text needs on servers that store text as records (OpenVMS). Never guessed from the file name. Not available for SFTP."
+  );
+
+function localPathSchema(what: string) {
+  return z.string().optional().describe(`${what}. Absolute, or relative to the MCP server's working directory; a leading ~ is expanded.`);
+}
+
+/** upload-file / append-file: exactly one source of bytes. */
+function sourceProblem(content: string | undefined, localPath: string | undefined, encoding: string | undefined): string | null {
+  if ((content === undefined) === (localPath === undefined)) {
+    return content === undefined
+      ? "Give exactly one of content and localPath; neither was given."
+      : "Give exactly one of content and localPath; both were given.";
+  }
+  if (localPath !== undefined && encoding !== undefined) {
+    return "encoding applies only to content; a localPath file is sent as its raw bytes.";
+  }
+  return null;
+}
+
+function modeProblem(protocol: ConnectionType, mode: TransferMode): string | null {
+  return protocol === ConnectionType.SFTP && mode === "ascii" ? SFTP_ASCII_MESSAGE : null;
+}
+
+/** For the transfer log when a transfer failed before reporting the path it used. */
+function displayLocalPath(localPath: string): string {
+  try {
+    return resolveLocalPath(localPath);
+  } catch {
+    return localPath;
+  }
+}
+
 interface ResolvedConnection {
   client: AnyFtpClient;
   host: string;
@@ -105,7 +144,7 @@ function resolveConnection(conn: ConnectionArgs): ResolvedConnection {
 // Create server instance
 const server = new McpServer({
   name: "mcp-server-ftp",
-  version: "1.4.0",
+  version: "1.5.0",
 });
 
 // The MCP SDK dispatches tool calls concurrently, but concurrent FTP operations
@@ -188,18 +227,64 @@ server.registerTool(
   "download-file",
   {
     title: "Download File",
-    description: "Download a file from the FTP/SFTP server. Text files are returned as-is; binary files are returned base64-encoded. Transferred file metadata is permanently logged to ftp_transfers.log.",
+    description: "Download a file from the FTP/SFTP server. Without localPath, text files are returned as-is and binary files base64-encoded, through the conversation. With localPath the file is streamed to that local file instead (any size) and only metadata is returned: bytes, SHA-256, duration, mode, never the content. localPath is absolute or relative to this server's working directory (a leading ~ is expanded); an existing file is refused unless overwrite is true, and no directories are created. transferMode \"ascii\" (FTP only) converts CR LF to LF and suits text on servers that keep text as records, such as OpenVMS; the default \"binary\" is byte-exact and right for archives and images. Transferred file metadata is permanently logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
+      localPath: localPathSchema("Local file to stream the download into instead of returning its content"),
+      overwrite: z.boolean().optional().describe("With localPath: replace the local file if it already exists (default: false, which refuses)"),
+      transferMode: transferModeSchema,
       ...connectionParamsSchema,
     },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath, ...conn }) => {
+  serialized(async ({ remotePath, localPath, overwrite, transferMode, ...conn }) => {
     const { client, host, port, protocol, user, logger } = resolveConnection(conn);
     const t0 = Date.now();
+    const mode: TransferMode = transferMode ?? "binary";
+    const problem =
+      (overwrite !== undefined && localPath === undefined ? "overwrite only applies together with localPath" : null) ??
+      modeProblem(protocol, mode);
+    if (problem) return errorResult("Error downloading file", new Error(problem));
     try {
-      const { content, encoding } = await client.downloadFile(remotePath);
+      if (localPath !== undefined) {
+        const r = await client.downloadToLocal(remotePath, localPath, mode, overwrite ?? false);
+        const durationMs = Date.now() - t0;
+        const logFile = logger.logTransfer({
+          operation: "DOWNLOAD",
+          host,
+          port,
+          protocol,
+          user,
+          remotePath,
+          sizeBytes: r.localBytes,
+          sha256: r.sha256,
+          localPath: r.localPath,
+          transferMode: mode,
+          wireBytes: r.wireBytes,
+          durationMs,
+          status: "SUCCESS",
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Downloaded ${remotePath} to ${r.localPath} (${formatBytes(r.localBytes)}, ${mode}, SHA-256 ${r.sha256}, ${durationMs} ms, logged to ${logFile})`
+            }
+          ],
+          structuredContent: {
+            remotePath,
+            localPath: r.localPath,
+            bytes: r.localBytes,
+            sha256: r.sha256,
+            transferMode: mode,
+            ...(mode === "ascii" ? { wireBytes: r.wireBytes } : {}),
+            durationMs,
+            logFile,
+          },
+        };
+      }
+
+      const { content, encoding } = await client.downloadFile(remotePath, mode);
       const durationMs = Date.now() - t0;
       const sizeBytes = Buffer.byteLength(content, encoding);
 
@@ -213,6 +298,7 @@ server.registerTool(
         sizeBytes,
         encoding,
         content,
+        transferMode: mode,
         durationMs,
         status: "SUCCESS",
       });
@@ -228,7 +314,7 @@ server.registerTool(
             text: `${header}\n\n${content}`
           }
         ],
-        structuredContent: { remotePath, content, encoding, sizeBytes, durationMs, logFile },
+        structuredContent: { remotePath, content, encoding, sizeBytes, transferMode: mode, durationMs, logFile },
       };
     } catch (error) {
       const durationMs = Date.now() - t0;
@@ -239,6 +325,8 @@ server.registerTool(
         protocol,
         user,
         remotePath,
+        localPath: localPath !== undefined ? displayLocalPath(localPath) : undefined,
+        transferMode: mode,
         durationMs,
         status: "FAILED",
         error: error instanceof Error ? error.message : String(error),
@@ -253,22 +341,28 @@ server.registerTool(
   "upload-file",
   {
     title: "Upload File",
-    description: "Upload a file to the FTP/SFTP server. Pass encoding \"base64\" to upload binary content. Transferred file metadata is permanently logged to ftp_transfers.log.",
+    description: "Upload a file to the FTP/SFTP server. Give exactly one of content (a string; pass encoding \"base64\" for binary content, but everything then passes through the conversation) or localPath (a local file streamed from disk: any size, no temporary copy, only metadata returned). localPath is absolute or relative to this server's working directory (a leading ~ is expanded). transferMode \"ascii\" (FTP only) sends TYPE A and converts local LF to CR LF, so text arrives with proper line ends on servers that keep text as records: a text file sent in the default binary mode to OpenVMS arrives as fixed 512-byte records that DCL cannot run. Use \"binary\" (the default, byte-exact) for archives, images and savesets. The mode is never guessed from the file name. Transferred file metadata is permanently logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Destination path on the FTP server"),
-      content: z.string().describe("Content to upload to the file"),
-      encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8)"),
+      content: z.string().optional().describe("Content to upload to the file (give this or localPath, not both)"),
+      localPath: localPathSchema("Local file to stream to the server (give this or content, not both)"),
+      encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8); not for use with localPath"),
+      transferMode: transferModeSchema,
       ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
-  serialized(async ({ remotePath, content, encoding, ...conn }) => {
+  serialized(async ({ remotePath, content, localPath, encoding, transferMode, ...conn }) => {
     const { client, host, port, protocol, user, logger } = resolveConnection(conn);
     const t0 = Date.now();
     const enc = encoding ?? "utf8";
-    const sizeBytes = Buffer.byteLength(content, enc);
+    const mode: TransferMode = transferMode ?? "binary";
+    const problem = sourceProblem(content, localPath, encoding) ?? modeProblem(protocol, mode);
+    if (problem) return errorResult("Error uploading file", new Error(problem));
     try {
-      await client.uploadFile(remotePath, content, enc);
+      const r = localPath !== undefined
+        ? await client.uploadLocalFile(remotePath, localPath, mode)
+        : await client.uploadFile(remotePath, content!, enc, mode);
       const durationMs = Date.now() - t0;
 
       const logFile = logger.logTransfer({
@@ -278,21 +372,34 @@ server.registerTool(
         protocol,
         user,
         remotePath,
-        sizeBytes,
-        encoding: enc,
-        content,
+        sizeBytes: r.localBytes,
+        sha256: r.sha256,
+        encoding: localPath === undefined ? enc : undefined,
+        localPath: r.localPath,
+        transferMode: mode,
+        wireBytes: r.wireBytes,
         durationMs,
         status: "SUCCESS",
       });
 
+      const from = r.localPath ? ` from ${r.localPath}` : "";
       return {
         content: [
           {
             type: "text" as const,
-            text: `File successfully uploaded to ${remotePath} (${formatBytes(sizeBytes)}, logged to ${logFile})`
+            text: `File successfully uploaded to ${remotePath}${from} (${formatBytes(r.localBytes)}, ${mode}, SHA-256 ${r.sha256}, logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, bytesWritten: sizeBytes, durationMs, logFile },
+        structuredContent: {
+          remotePath,
+          bytesWritten: r.localBytes,
+          sha256: r.sha256,
+          transferMode: mode,
+          ...(r.localPath ? { localPath: r.localPath } : {}),
+          ...(mode === "ascii" ? { wireBytes: r.wireBytes } : {}),
+          durationMs,
+          logFile,
+        },
       };
     } catch (error) {
       const durationMs = Date.now() - t0;
@@ -303,9 +410,10 @@ server.registerTool(
         protocol,
         user,
         remotePath,
-        sizeBytes,
-        encoding: enc,
-        content,
+        ...(localPath !== undefined
+          ? { localPath: displayLocalPath(localPath) }
+          : { sizeBytes: Buffer.byteLength(content!, enc), encoding: enc, content }),
+        transferMode: mode,
         durationMs,
         status: "FAILED",
         error: error instanceof Error ? error.message : String(error),
@@ -569,22 +677,28 @@ server.registerTool(
   "append-file",
   {
     title: "Append to File",
-    description: "Append content to the end of a file on the FTP/SFTP server (creates the file if it does not exist). Pass encoding \"base64\" for binary content. File appends are logged to ftp_transfers.log.",
+    description: "Append to the end of a file on the FTP/SFTP server (creates the file if it does not exist). Give exactly one of content (a string; pass encoding \"base64\" for binary content) or localPath (a local file streamed from disk; absolute or relative to this server's working directory, a leading ~ is expanded). transferMode \"ascii\" (FTP only) converts local LF to CR LF as for upload-file; the default \"binary\" is byte-exact. File appends are logged to ftp_transfers.log.",
     inputSchema: {
       remotePath: z.string().describe("Path of the file on the FTP server"),
-      content: z.string().describe("Content to append to the file"),
-      encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8)"),
+      content: z.string().optional().describe("Content to append to the file (give this or localPath, not both)"),
+      localPath: localPathSchema("Local file to stream onto the end of the remote file (give this or content, not both)"),
+      encoding: z.enum(["utf8", "base64"]).optional().describe("Encoding of the provided content (default: utf8); not for use with localPath"),
+      transferMode: transferModeSchema,
       ...connectionParamsSchema,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
-  serialized(async ({ remotePath, content, encoding, ...conn }) => {
+  serialized(async ({ remotePath, content, localPath, encoding, transferMode, ...conn }) => {
     const { client, host, port, protocol, user, logger } = resolveConnection(conn);
     const t0 = Date.now();
     const enc = encoding ?? "utf8";
-    const sizeBytes = Buffer.byteLength(content, enc);
+    const mode: TransferMode = transferMode ?? "binary";
+    const problem = sourceProblem(content, localPath, encoding) ?? modeProblem(protocol, mode);
+    if (problem) return errorResult("Error appending to file", new Error(problem));
     try {
-      await client.appendFile(remotePath, content, enc);
+      const r = localPath !== undefined
+        ? await client.appendLocalFile(remotePath, localPath, mode)
+        : await client.appendFile(remotePath, content!, enc, mode);
       const durationMs = Date.now() - t0;
 
       const logFile = logger.logTransfer({
@@ -594,21 +708,34 @@ server.registerTool(
         protocol,
         user,
         remotePath,
-        sizeBytes,
-        encoding: enc,
-        content,
+        sizeBytes: r.localBytes,
+        sha256: r.sha256,
+        encoding: localPath === undefined ? enc : undefined,
+        localPath: r.localPath,
+        transferMode: mode,
+        wireBytes: r.wireBytes,
         durationMs,
         status: "SUCCESS",
       });
 
+      const from = r.localPath ? ` from ${r.localPath}` : "";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Successfully appended ${formatBytes(sizeBytes)} to ${remotePath} (logged to ${logFile})`
+            text: `Successfully appended ${formatBytes(r.localBytes)}${from} to ${remotePath} (${mode}, logged to ${logFile})`
           }
         ],
-        structuredContent: { remotePath, appendedBytes: sizeBytes, durationMs, logFile },
+        structuredContent: {
+          remotePath,
+          appendedBytes: r.localBytes,
+          sha256: r.sha256,
+          transferMode: mode,
+          ...(r.localPath ? { localPath: r.localPath } : {}),
+          ...(mode === "ascii" ? { wireBytes: r.wireBytes } : {}),
+          durationMs,
+          logFile,
+        },
       };
     } catch (error) {
       const durationMs = Date.now() - t0;
@@ -619,9 +746,10 @@ server.registerTool(
         protocol,
         user,
         remotePath,
-        sizeBytes,
-        encoding: enc,
-        content,
+        ...(localPath !== undefined
+          ? { localPath: displayLocalPath(localPath) }
+          : { sizeBytes: Buffer.byteLength(content!, enc), encoding: enc, content }),
+        transferMode: mode,
         durationMs,
         status: "FAILED",
         error: error instanceof Error ? error.message : String(error),
@@ -656,7 +784,7 @@ async function main() {
   await server.connect(transport);
   const defaultLogger = new TransferLogger();
   console.error(
-    `FTP MCP Server v1.4.0 running on stdio (log directory: ${defaultLogger.getLogDir()})`
+    `FTP MCP Server v1.5.0 running on stdio (log directory: ${defaultLogger.getLogDir()})`
   );
 }
 
