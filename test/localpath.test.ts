@@ -156,6 +156,42 @@ describe("localPath streaming (FTP)", () => {
   });
 });
 
+describe("advertised output schemas", () => {
+  let srv: TestFtpServer;
+  let mcp: McpHandle;
+  let local: string;
+  before(async () => { srv = await startFtpServer(); mcp = await startMcp(); local = scratchDir(); });
+  after(async () => { await mcp.close(); await srv.close(); fs.rmSync(local, { recursive: true, force: true }); });
+
+  test("the tool list advertises the new parameters", async () => {
+    const tools = (await mcp.client.listTools()).tools;
+    const props = (name: string) => Object.keys((tools.find((t) => t.name === name)!.inputSchema as any).properties);
+    for (const t of ["upload-file", "append-file"]) {
+      assert.ok(props(t).includes("localPath") && props(t).includes("transferMode"), `${t}: ${props(t)}`);
+    }
+    assert.deepEqual(["localPath", "overwrite", "transferMode"].filter((k) => !props("download-file").includes(k)), []);
+    // content is no longer required, since localPath is the alternative
+    for (const t of ["upload-file", "append-file"]) {
+      assert.ok(!((tools.find((x) => x.name === t)!.inputSchema as any).required ?? []).includes("content"), `${t} still requires content`);
+    }
+  });
+
+  test("localPath results satisfy the advertised outputSchema (the client validates it)", async () => {
+    // startMcp() has listed the tools, so the SDK client validates each structuredContent
+    // against the tool's outputSchema and throws when it does not match.
+    const src = path.join(local, "s.txt");
+    fs.writeFileSync(src, "one\ntwo\n");
+    const up = await mcp.call("upload-file", { ...ftpArgs(srv), remotePath: "s.txt", localPath: src, transferMode: "ascii" });
+    assert.ok(!up.isError, resultText(up));
+    const dl = await mcp.call("download-file", { ...ftpArgs(srv), remotePath: "s.txt", localPath: path.join(local, "s-back.txt"), transferMode: "ascii" });
+    assert.ok(!dl.isError, resultText(dl));
+    const ap = await mcp.call("append-file", { ...ftpArgs(srv), remotePath: "s.txt", localPath: src });
+    assert.ok(!ap.isError, resultText(ap));
+    const content = await mcp.call("download-file", { ...ftpArgs(srv), remotePath: "s.txt" });
+    assert.ok(!content.isError, resultText(content));
+  });
+});
+
 describe("argument validation", () => {
   let mcp: McpHandle;
   let srv: TestFtpServer;

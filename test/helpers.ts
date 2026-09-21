@@ -109,6 +109,10 @@ export async function startMcp(extraEnv: Record<string, string> = {}): Promise<M
   const transport = new StdioClientTransport({ command: process.execPath, args: [SERVER_JS], env, stderr: "ignore" });
   const client = new Client({ name: "mcp-ftp-test", version: "0.0.0" });
   await client.connect(transport);
+  // Listing the tools makes the SDK client remember each tool's outputSchema and validate every
+  // structuredContent result against it, as a real client does. Without this a result that
+  // contradicts the advertised schema would pass unnoticed.
+  await client.listTools();
   return {
     client,
     logDir,

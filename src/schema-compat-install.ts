@@ -27,6 +27,7 @@ const outputSchemas: Record<string, Record<string, unknown>> = {
     },
     required: ["path", "entries", "totalCount", "directoryCount", "fileCount"],
   },
+  // Two result shapes: file content returned through the conversation, or (with localPath) metadata only.
   "download-file": {
     type: "object",
     properties: {
@@ -34,16 +35,28 @@ const outputSchemas: Record<string, Record<string, unknown>> = {
       content: { type: "string" },
       encoding: { type: "string", enum: ["utf8", "base64"] },
       sizeBytes: { type: "number" },
+      localPath: { type: "string" },
+      bytes: { type: "number" },
+      sha256: { type: "string" },
+      transferMode: { type: "string", enum: ["binary", "ascii"] },
+      wireBytes: { type: "number" },
       durationMs: { type: "number" },
       logFile: { type: "string" },
     },
-    required: ["remotePath", "content", "encoding"],
+    oneOf: [
+      { required: ["remotePath", "content", "encoding"] },
+      { required: ["remotePath", "localPath", "bytes", "sha256"] },
+    ],
   },
   "upload-file": {
     type: "object",
     properties: {
       remotePath: { type: "string" },
       bytesWritten: { type: "number" },
+      sha256: { type: "string" },
+      transferMode: { type: "string", enum: ["binary", "ascii"] },
+      localPath: { type: "string" },
+      wireBytes: { type: "number" },
       durationMs: { type: "number" },
       logFile: { type: "string" },
     },
@@ -100,6 +113,10 @@ const outputSchemas: Record<string, Record<string, unknown>> = {
     properties: {
       remotePath: { type: "string" },
       appendedBytes: { type: "number" },
+      sha256: { type: "string" },
+      transferMode: { type: "string", enum: ["binary", "ascii"] },
+      localPath: { type: "string" },
+      wireBytes: { type: "number" },
       durationMs: { type: "number" },
       logFile: { type: "string" },
     },
