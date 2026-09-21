@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
+    "test": "tsc -p tsconfig.test.json && node --test --test-timeout=180000 \"build-test/test/*.test.js\"",
     "dev": "npm run build && npm start",
     "prepublishOnly": "npm run build",
     "encrypt-env": "node scripts/encrypt-env.js",
@@ -36,6 +37,7 @@
   "devDependencies": {
     "@types/node": "^20.9.0",
     "@types/ssh2-sftp-client": "^9.0.6",
+    "ftp-srv": "^4.6.3",
     "typescript": "^5.2.2"
   },
   "files": [

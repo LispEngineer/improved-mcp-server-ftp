@@ -38,3 +38,5 @@ out/
 *.swp
 *.swo
 .DS_Store
+# Test build output (npm test); never the installed build/
+build-test/
