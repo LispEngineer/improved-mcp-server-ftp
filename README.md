@@ -6,8 +6,14 @@ Improvements:
 * Support VMS conventions
 * Persistent transfer audit logging (`ftp_transfers.log`) with timestamps, file 
   sizes, transfer durations, and SHA-256 integrity hashes
+* Stream files between the server's disk and the remote server with `localPath`
+  (any size; the content never passes through the conversation)
+* FTP ASCII transfer mode (`transferMode: "ascii"`), so text files arrive with
+  proper line ends on servers that store text as records, such as OpenVMS
+* A test suite that needs no remote machine (`npm test`)
 
 Improver: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`) with Gemini 3.8 Flash
+and Claude Sonnet 5
 
 ---
 
@@ -29,6 +35,7 @@ This Model Context Protocol (MCP) server provides file-management tools for FTP,
 
 - List files and directories
 - Download and upload text or binary files
+- Stream files of any size to and from local disk (`localPath`), and choose FTP binary or ASCII transfer mode (`transferMode`)
 - Edit exact text in remote files
 - Append to files
 - Rename or move files/directories
@@ -82,6 +89,10 @@ cd mcp-server-ftp
 npm install
 npm run build
 ```
+
+## Testing
+
+`npm test` compiles `src` and `test` into `build-test/` (never `build/`, which is the installed server) and runs the suite with `node --test`. It needs no remote machine: it starts a throw-away FTP server ([`ftp-srv`](https://www.npmjs.com/package/ftp-srv), a dev-dependency) on a loopback port, and an unprivileged OpenSSH `sshd` for the SFTP tests (skipped if `sshd` is not installed), and drives the real MCP server over stdio. `ftp-srv` stores the bytes it receives untranslated, so the tests can assert what ASCII mode really puts on the wire.
 
 ## Configuration
 
@@ -245,14 +256,14 @@ npm run encrypt-env -- <plaintext-value>
 | Tool | Description |
 |---|---|
 | `list-directory` | List contents of a remote directory |
-| `download-file` | Download a file; binary content is returned as base64 |
-| `upload-file` | Upload text or base64-encoded binary content |
+| `download-file` | Download a file; content is returned (binary as base64), or with `localPath` streamed to a local file |
+| `upload-file` | Upload text or base64-encoded binary `content`, or stream a local file with `localPath` |
 | `create-directory` | Create a directory |
 | `delete-file` | Delete a file |
 | `delete-directory` | Delete a directory |
 | `rename-file` | Rename or move a file or directory |
 | `edit-file` | Replace exact text in a remote text file |
-| `append-file` | Append content to a file, creating it if needed |
+| `append-file` | Append `content` or a local file (`localPath`) to a file, creating it if needed |
 
 Tool calls return machine-readable `structuredContent`, and all nine tools advertise output schemas. Version 1.2.2 includes a compatibility shim that ensures advertised schemas use the JSON Schema 2020-12 dialect required by current MCP clients.
 
@@ -288,6 +299,26 @@ If any parameter is omitted from a tool call, the server automatically falls bac
 }
 ```
 
+## Streaming local files and transfer modes
+
+### `localPath`
+
+`upload-file`, `append-file` and `download-file` take an optional `localPath`.
+
+- `upload-file` / `append-file`: give **exactly one** of `content` and `localPath`. With `localPath` the file is read from disk and streamed: no temporary copy, no size limit, and none of the file passes through the conversation. `encoding` applies only to `content`.
+- `download-file`: with `localPath` the file is streamed to that path and only metadata is returned (`bytes`, `sha256`, `transferMode`, `durationMs`, `logFile`), never the content. An existing local file is **refused** unless `overwrite: true`. No directories are created. The bytes are written to a hidden temporary file next to the target and moved into place only when the transfer succeeds, so a failed download never leaves a partial file at the target.
+- A path is absolute, or relative to the MCP server's working directory (the directory the client launched it in); a leading `~` is expanded.
+- Sizes and SHA-256 are always those of the **local** file.
+
+### `transferMode` (FTP only)
+
+`"binary"` (the default) or `"ascii"`, on the same three tools. The caller chooses; the mode is never guessed from the file name.
+
+- `binary` is `TYPE I`: byte-exact. Use it for archives, images, BACKUP savesets.
+- `ascii` is `TYPE A` (RFC 959): the wire form of a line end is CR LF. The server converts local LF to CR LF on upload and CR LF to LF on download (a lone CR is data and is left alone; a CR LF already present is not doubled). `basic-ftp` sends `TYPE A` but converts nothing, so this is done here, in a streaming converter that is correct across chunk boundaries. The data type is put back to `TYPE I` afterwards, also on failure.
+- With ascii the wire and remote sizes legitimately differ from the local file's; the result reports `wireBytes` as well.
+- SFTP has no such mode: `transferMode: "ascii"` with SFTP is rejected with a clear message before any connection is made.
+
 ## Transfer Logging
 
 Starting in version 1.4.0, all file operations (`upload-file`, `download-file`, `append-file`, `edit-file`, and `delete-file`) are permanently recorded to a transfer audit log (`ftp_transfers.log`), modeled after the session logging mechanism in `chuk-mcp-telnet-client`.
@@ -299,9 +330,12 @@ Each transfer event records a structured human-readable block containing:
 - **Target host, port, protocol, and username**
 - **Remote file path**
 - **File size** in bytes and human-readable units (B, KB, MB, GB)
-- **SHA-256 integrity hash** computed automatically from the transferred or modified payload
+- **SHA-256 integrity hash** computed automatically from the transferred or modified payload. For `localPath` transfers it is the hash of the **local** file, and the block says so
+- **Transfer mode** (`Mode`), the **local path**, and, in ASCII mode, the bytes on the wire (`Wire Bytes`)
 - **Transfer duration** (in milliseconds) and effective transfer speed (e.g. `KB/s`)
 - **Error details** if the operation failed
+
+File content is never written to the log. `localPath` transfers are streamed in chunks and never loaded whole.
 
 ### Example log entry
 ```text
@@ -334,13 +368,16 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
 - **Directory listing parser**: Dedicated fallback parser for OpenVMS `LIST` output (`FILENAME.EXT;VER`, 512-byte blocks, ISO date conversion, `*.DIR;*` subdirectories, and 2-line wrapped entries).
 - **Versioned deletion**: Automatically retries unversioned deletions with `;0` (latest version) when OpenVMS requires a version specification.
 - **Path normalization**: Translates `.` and `./` to `""` for current-directory listings.
+- **Text files need `transferMode: "ascii"`.** A `.COM` (or any text) file sent in binary mode arrives as *Fixed length 512 byte records*, and DCL refuses to run it (`%RMS-W-RTB, 512 byte record too large for user's buffer`). Sent in ASCII mode it lands as *Variable length, Carriage return carriage control* and runs. Measured on a SIMH-simulated VAX running OpenVMS VAX V7.3 with TCP/IP Services; see `LOCALPATH_AND_ASCII_REPORT.md`. Binary files (savesets) go in binary mode.
+- The FTP server wants a version to delete: `delete-file` retries `FILE.EXT` as `FILE.EXT;0`; `FILE.EXT;*` also works.
 
 ## Security notes
 
 - Prefer SFTP when available; it uses SSH encryption and key authentication without FTPS certificate configuration.
 - Use `FTP_SECURE=true` only for FTPS servers using the FTP protocol path.
 - Use credential encryption when a client configuration would otherwise contain plaintext credentials.
-- FTP and SFTP transfers may use short-lived local temporary files for upload/download/append operations; those files are removed during cleanup after each operation.
+- FTP and SFTP transfers of `content` may use short-lived local temporary files; those files are removed during cleanup after each operation. `localPath` uploads use none.
+- `localPath` lets a tool call read or write any local path the server process can (upload reads it, download writes it; `overwrite` defaults to false). It is as trusted as the process itself, so treat a client that may call these tools accordingly.
 
 ## Troubleshooting Windows builds
 

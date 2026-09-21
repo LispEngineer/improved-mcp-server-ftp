@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "mcp-server-ftp",
   "display_name": "FTP Access Server",
-  "version": "1.2.2",
+  "version": "1.5.0",
   "description": "MCP server for FTP, FTPS, and SFTP access: list, download, upload, edit, append, rename, and delete files and directories on remote servers.",
   "long_description": "Interact with FTP, FTPS, and SFTP servers using natural language. Supports binary-safe file transfers, in-place text edits, appends, renames, directory management, FTPS/TLS, SFTP password or SSH key authentication, and AES-256-GCM encrypted credentials with OS keychain support for the encryption key.",
   "author": {
@@ -141,11 +141,14 @@
     },
     {
       "name": "download-file",
-      "description": "Download a remote file; binary files are returned base64-encoded",
+      "description": "Download a remote file. Without localPath its content is returned (binary files base64-encoded); with localPath it is streamed to a local file and only metadata is returned. transferMode ascii converts CR LF to LF (FTP only).",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "remotePath": {"type": "string", "description": "Path of the file on the remote server"}
+          "remotePath": {"type": "string", "description": "Path of the file on the remote server"},
+          "localPath": {"type": "string", "description": "Local file to stream the download into instead of returning its content; absolute or relative to the server's working directory, ~ is expanded"},
+          "overwrite": {"type": "boolean", "description": "With localPath: replace an existing local file (default: false, which refuses)"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"], "description": "FTP data type (default: binary). ascii is not available for SFTP"}
         },
         "required": ["remotePath"]
       },
@@ -154,29 +157,41 @@
         "properties": {
           "remotePath": {"type": "string"},
           "content": {"type": "string"},
-          "encoding": {"type": "string", "enum": ["utf8", "base64"]}
+          "encoding": {"type": "string", "enum": ["utf8", "base64"]},
+          "localPath": {"type": "string"},
+          "bytes": {"type": "number"},
+          "sha256": {"type": "string"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"]}
         },
-        "required": ["remotePath", "content", "encoding"]
+        "oneOf": [
+          {"required": ["remotePath", "content", "encoding"]},
+          {"required": ["remotePath", "localPath", "bytes", "sha256"]}
+        ]
       },
-      "annotations": {"readOnlyHint": true, "openWorldHint": false}
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false}
     },
     {
       "name": "upload-file",
-      "description": "Upload a remote file; supports base64 for binary content",
+      "description": "Upload a remote file from content (base64 for binary) or stream a local file with localPath; transferMode ascii converts LF to CR LF (FTP only)",
       "inputSchema": {
         "type": "object",
         "properties": {
           "remotePath": {"type": "string", "description": "Destination path on the remote server"},
-          "content": {"type": "string", "description": "Content to upload"},
-          "encoding": {"type": "string", "enum": ["utf8", "base64"], "description": "Encoding of the provided content (default: utf8)"}
+          "content": {"type": "string", "description": "Content to upload (give this or localPath, not both)"},
+          "localPath": {"type": "string", "description": "Local file to stream to the server (give this or content, not both); absolute or relative to the server's working directory, ~ is expanded"},
+          "encoding": {"type": "string", "enum": ["utf8", "base64"], "description": "Encoding of the provided content (default: utf8); not for use with localPath"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"], "description": "FTP data type (default: binary). ascii is not available for SFTP"}
         },
-        "required": ["remotePath", "content"]
+        "required": ["remotePath"]
       },
       "outputSchema": {
         "type": "object",
         "properties": {
           "remotePath": {"type": "string"},
-          "bytesWritten": {"type": "number"}
+          "bytesWritten": {"type": "number"},
+          "sha256": {"type": "string"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"]},
+          "localPath": {"type": "string"}
         },
         "required": ["remotePath", "bytesWritten"]
       },
@@ -208,21 +223,26 @@
     },
     {
       "name": "append-file",
-      "description": "Append content to a remote file, creating it if missing",
+      "description": "Append to a remote file, creating it if missing, from content or a local file (localPath); transferMode ascii converts LF to CR LF (FTP only)",
       "inputSchema": {
         "type": "object",
         "properties": {
           "remotePath": {"type": "string", "description": "Path of the file on the remote server"},
-          "content": {"type": "string", "description": "Content to append"},
-          "encoding": {"type": "string", "enum": ["utf8", "base64"], "description": "Encoding of the provided content (default: utf8)"}
+          "content": {"type": "string", "description": "Content to append (give this or localPath, not both)"},
+          "localPath": {"type": "string", "description": "Local file to stream onto the end of the remote file (give this or content, not both)"},
+          "encoding": {"type": "string", "enum": ["utf8", "base64"], "description": "Encoding of the provided content (default: utf8); not for use with localPath"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"], "description": "FTP data type (default: binary). ascii is not available for SFTP"}
         },
-        "required": ["remotePath", "content"]
+        "required": ["remotePath"]
       },
       "outputSchema": {
         "type": "object",
         "properties": {
           "remotePath": {"type": "string"},
-          "appendedBytes": {"type": "number"}
+          "appendedBytes": {"type": "number"},
+          "sha256": {"type": "string"},
+          "transferMode": {"type": "string", "enum": ["binary", "ascii"]},
+          "localPath": {"type": "string"}
         },
         "required": ["remotePath", "appendedBytes"]
       },

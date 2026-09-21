@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 1.5.0 — 2026-09-21
+**Contributors**: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`), with Claude Sonnet 5
+
+### Added
+- **`localPath` on `upload-file`, `append-file` and `download-file`**: stream a local file to or from the server, with no temporary copy and no size limit; only metadata (bytes, SHA-256, mode, duration) is returned, never content. `upload-file`/`append-file` take exactly one of `content` and `localPath`. `download-file` refuses to overwrite an existing local file unless `overwrite: true`, creates no directories, and never leaves a partial file at the target on failure. Works over FTP and SFTP.
+- **`transferMode: "binary" | "ascii"`** (default `"binary"`) on the same three tools. FTP ASCII sends `TYPE A` and converts LF to CR LF on upload and CR LF to LF on download with a streaming converter that is correct across chunk boundaries; the connection is put back to `TYPE I` afterwards, also on failure. Rejected for SFTP. Fixes text files (e.g. OpenVMS `.COM`) arriving as fixed 512-byte records.
+- Transfer log: `Mode`, `Local Path` (with a note that size and SHA-256 are of the local file) and `Wire Bytes` lines. Existing lines are unchanged.
+- Results gain `sha256` and `transferMode`; `download-file` with `localPath` returns `localPath`, `bytes`, `sha256`, `transferMode` and no `content`.
+- `npm test`: a suite that needs no remote machine (loopback `ftp-srv` and, for SFTP, an unprivileged `sshd`). `ftp-srv` is a dev-dependency.
+
+### Changed
+- `download-file` is no longer annotated read-only: with `localPath` it writes a local file (and can replace one with `overwrite`).
+- Advertised `outputSchema`: `download-file` is a `oneOf` (content result, or local-file result); `upload-file` and `append-file` gain the new optional fields. `content` is no longer required on `upload-file` and `append-file`.
+- Content-based upload and append send an in-memory stream instead of a temporary file. Download-to-content still uses a temporary file.
+- `manifest.json` brought up to 1.5.0 (it still said 1.2.2) with the new tool parameters.
+
 ## 1.4.0 — 2026-09-14
 **Contributors**: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`)
 
