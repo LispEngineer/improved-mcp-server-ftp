@@ -3,7 +3,18 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { isUtf8 } from "buffer";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import { PassThrough, Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { CrlfToLf, LfToCrlf } from "./text-mode.js";
+import {
+  LocalTransferResult,
+  TransferMode,
+  commitDownload,
+  discardTemp,
+  prepareDownloadTarget,
+  requireLocalSource,
+} from "./transfer.js";
 
 // Define FTP config interface
 export interface FtpConfig {
@@ -15,6 +26,54 @@ export interface FtpConfig {
 }
 
 export type FileEncoding = "utf8" | "base64";
+
+/**
+ * Run `operation` with the data type set for `mode`, and put the connection
+ * back to TYPE I afterwards, even if the operation fails.
+ *
+ * basic-ftp sends `TYPE I` once at login and assumes it stays that way, so an
+ * ASCII transfer that left TYPE A behind would silently corrupt the next
+ * binary transfer on the same connection. This server currently opens a fresh
+ * connection per operation (see `withConnection`), so nothing reuses one
+ * today; the restore keeps that true if it ever changes.
+ */
+export async function withTransferType<T>(client: Client, mode: TransferMode, operation: () => Promise<T>): Promise<T> {
+  if (mode !== "ascii") return operation();
+  await client.send("TYPE A");
+  try {
+    return await operation();
+  } finally {
+    try {
+      await client.sendIgnoringError("TYPE I");
+    } catch {
+      /* the connection is already gone, so there is nothing left to restore */
+    }
+  }
+}
+
+interface StreamCounts {
+  localBytes: number;
+  wireBytes: number;
+}
+
+/**
+ * Wrap a source of local bytes for sending: hash and count what is read (the
+ * LOCAL bytes) and, for ASCII mode, convert LF to CR LF on the way out.
+ */
+async function* toWire(source: AsyncIterable<Buffer> | Iterable<Buffer>, mode: TransferMode, hash: ReturnType<typeof createHash>, counts: StreamCounts) {
+  const encoder = mode === "ascii" ? new LfToCrlf() : null;
+  for await (const chunk of source) {
+    hash.update(chunk);
+    counts.localBytes += chunk.length;
+    const out = encoder ? encoder.convert(chunk) : chunk;
+    counts.wireBytes += out.length;
+    if (out.length > 0) yield out;
+  }
+}
+
+function readLocalFile(file: string): AsyncIterable<Buffer> {
+  return fs.createReadStream(file, { highWaterMark: 256 * 1024 }) as unknown as AsyncIterable<Buffer>;
+}
 
 /**
  * Custom directory listing parser for OpenVMS TCP/IP Services FTP servers.
@@ -153,10 +212,74 @@ export class FtpClient {
     }
   }
 
-  async downloadFile(remotePath: string): Promise<{content: string, encoding: FileEncoding}> {
+  /**
+   * Fetch `remotePath` into the local file `tempPath` (which must not exist),
+   * converting CR LF to LF in ASCII mode. Counts, and hashes, the bytes as
+   * written locally.
+   */
+  private async receiveToFile(remotePath: string, tempPath: string, mode: TransferMode): Promise<LocalTransferResult> {
+    const hash = createHash("sha256");
+    const counts: StreamCounts = { localBytes: 0, wireBytes: 0 };
+    const decoder = mode === "ascii" ? new CrlfToLf() : null;
+
+    // basic-ftp pipes the data socket into `head` and ends it; the pipeline below
+    // carries it on through the (optional) converter into the file.
+    const head = new PassThrough();
+    const written = pipeline(
+      head,
+      async function* (source: AsyncIterable<Buffer>) {
+        for await (const chunk of source) {
+          counts.wireBytes += chunk.length;
+          const out = decoder ? decoder.convert(chunk) : chunk;
+          if (out.length > 0) {
+            hash.update(out);
+            counts.localBytes += out.length;
+            yield out;
+          }
+        }
+        const tail = decoder ? decoder.flush() : null;
+        if (tail && tail.length > 0) {
+          hash.update(tail);
+          counts.localBytes += tail.length;
+          yield tail;
+        }
+      },
+      fs.createWriteStream(tempPath, { flags: "wx" })
+    );
+    written.catch(() => {}); // observed below; this keeps an early failure from being "unhandled"
+
+    try {
+      await this.withConnection((client) => withTransferType(client, mode, () => client.downloadTo(head, remotePath)));
+      await written;
+    } catch (error) {
+      head.destroy();
+      await written.catch(() => {});
+      throw error;
+    }
+    return { localBytes: counts.localBytes, wireBytes: counts.wireBytes, sha256: hash.digest("hex"), transferMode: mode };
+  }
+
+  /** Send `source` with STOR (replace) or APPE (append), converting LF to CR LF in ASCII mode. */
+  private async sendFromSource(command: "STOR" | "APPE", remotePath: string, source: AsyncIterable<Buffer> | Iterable<Buffer>, mode: TransferMode): Promise<LocalTransferResult> {
+    const hash = createHash("sha256");
+    const counts: StreamCounts = { localBytes: 0, wireBytes: 0 };
+    const wire = Readable.from(toWire(source, mode, hash, counts), { objectMode: false });
+    try {
+      await this.withConnection((client) =>
+        withTransferType(client, mode, () =>
+          command === "STOR" ? client.uploadFrom(wire, remotePath) : client.appendFrom(wire, remotePath)
+        )
+      );
+    } finally {
+      wire.destroy();
+    }
+    return { localBytes: counts.localBytes, wireBytes: counts.wireBytes, sha256: hash.digest("hex"), transferMode: mode };
+  }
+
+  async downloadFile(remotePath: string, mode: TransferMode = "binary"): Promise<{content: string, encoding: FileEncoding}> {
     const tempFilePath = path.join(this.tempDir, `download-${randomUUID()}-${path.basename(remotePath)}`);
     try {
-      await this.withConnection((client) => client.downloadTo(tempFilePath, remotePath));
+      await this.receiveToFile(remotePath, tempFilePath, mode);
 
       // Read as raw bytes; only decode as utf8 when the content actually is valid utf8,
       // otherwise fall back to base64 so binary files survive the round trip
@@ -173,18 +296,41 @@ export class FtpClient {
     }
   }
 
-  async uploadFile(remotePath: string, content: string, encoding: FileEncoding = "utf8"): Promise<boolean> {
-    const tempFilePath = path.join(this.tempDir, `upload-${randomUUID()}-${path.basename(remotePath)}`);
+  /** Stream `remotePath` to a local file. Refuses to replace an existing file unless `overwrite`; creates no directories. */
+  async downloadToLocal(remotePath: string, localPath: string, mode: TransferMode = "binary", overwrite = false): Promise<LocalTransferResult> {
     try {
-      fs.writeFileSync(tempFilePath, Buffer.from(content, encoding));
+      const dest = prepareDownloadTarget(localPath, overwrite);
+      try {
+        const result = await this.receiveToFile(remotePath, dest.temp, mode);
+        commitDownload(dest, overwrite);
+        return { ...result, localPath: dest.target };
+      } catch (error) {
+        discardTemp(dest.temp);
+        throw error;
+      }
+    } catch (error) {
+      console.error("Download file error:", error);
+      throw new Error(`Failed to download file: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
-      await this.withConnection((client) => client.uploadFrom(tempFilePath, remotePath));
-      return true;
+  async uploadFile(remotePath: string, content: string, encoding: FileEncoding = "utf8", mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    try {
+      return await this.sendFromSource("STOR", remotePath, [Buffer.from(content, encoding)], mode);
     } catch (error) {
       console.error("Upload file error:", error);
       throw new Error(`Failed to upload file: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    }
+  }
+
+  /** Stream a local file to `remotePath` with no temporary copy and no size limit. */
+  async uploadLocalFile(remotePath: string, localPath: string, mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    try {
+      const source = requireLocalSource(localPath);
+      return { ...(await this.sendFromSource("STOR", remotePath, readLocalFile(source), mode)), localPath: source };
+    } catch (error) {
+      console.error("Upload file error:", error);
+      throw new Error(`Failed to upload file: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -228,18 +374,23 @@ export class FtpClient {
     }
   }
 
-  async appendFile(remotePath: string, content: string, encoding: FileEncoding = "utf8"): Promise<boolean> {
-    const tempFilePath = path.join(this.tempDir, `append-${randomUUID()}-${path.basename(remotePath)}`);
+  async appendFile(remotePath: string, content: string, encoding: FileEncoding = "utf8", mode: TransferMode = "binary"): Promise<LocalTransferResult> {
     try {
-      fs.writeFileSync(tempFilePath, Buffer.from(content, encoding));
-
-      await this.withConnection((client) => client.appendFrom(tempFilePath, remotePath));
-      return true;
+      return await this.sendFromSource("APPE", remotePath, [Buffer.from(content, encoding)], mode);
     } catch (error) {
       console.error("Append file error:", error);
       throw new Error(`Failed to append to file: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    }
+  }
+
+  /** Stream a local file onto the end of `remotePath`. */
+  async appendLocalFile(remotePath: string, localPath: string, mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    try {
+      const source = requireLocalSource(localPath);
+      return { ...(await this.sendFromSource("APPE", remotePath, readLocalFile(source), mode)), localPath: source };
+    } catch (error) {
+      console.error("Append file error:", error);
+      throw new Error(`Failed to append to file: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

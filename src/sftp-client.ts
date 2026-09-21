@@ -3,8 +3,18 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { isUtf8 } from "buffer";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { FileEncoding } from "./ftp-client.js";
+import {
+  LocalTransferResult,
+  SFTP_ASCII_MESSAGE,
+  TransferMode,
+  commitDownload,
+  discardTemp,
+  hashLocalFile,
+  prepareDownloadTarget,
+  requireLocalSource,
+} from "./transfer.js";
 import { isOnePasswordRef, readOnePasswordSecret } from "./onepassword.js";
 
 export interface SftpConfig {
@@ -121,7 +131,8 @@ export class SftpClient {
     }
   }
 
-  async downloadFile(remotePath: string): Promise<{ content: string; encoding: FileEncoding }> {
+  async downloadFile(remotePath: string, mode: TransferMode = "binary"): Promise<{ content: string; encoding: FileEncoding }> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
     const client = new Ssh2SftpClient();
     const tempFilePath = path.join(this.tempDir, `download-${randomUUID()}-${path.basename(remotePath)}`);
     try {
@@ -140,16 +151,52 @@ export class SftpClient {
     }
   }
 
-  async uploadFile(remotePath: string, content: string, encoding: FileEncoding = "utf8"): Promise<boolean> {
+  async uploadFile(remotePath: string, content: string, encoding: FileEncoding = "utf8", mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
     const client = new Ssh2SftpClient();
     const tempFilePath = path.join(this.tempDir, `upload-${randomUUID()}-${path.basename(remotePath)}`);
     try {
-      fs.writeFileSync(tempFilePath, Buffer.from(content, encoding));
+      const bytes = Buffer.from(content, encoding);
+      fs.writeFileSync(tempFilePath, bytes);
       await client.connect(await this.buildClientOptions());
       await client.fastPut(tempFilePath, remotePath);
-      return true;
+      return { localBytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), transferMode: "binary" };
     } finally {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+      await safeDisconnect(client);
+    }
+  }
+
+  /** Stream a local file to `remotePath` (ssh2's fastPut reads it from disk; no temporary copy). */
+  async uploadLocalFile(remotePath: string, localPath: string, mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
+    const source = requireLocalSource(localPath);
+    const client = new Ssh2SftpClient();
+    try {
+      await client.connect(await this.buildClientOptions());
+      await client.fastPut(source, remotePath);
+    } finally {
+      await safeDisconnect(client);
+    }
+    const { bytes, sha256 } = await hashLocalFile(source);
+    return { localBytes: bytes, sha256, transferMode: "binary", localPath: source };
+  }
+
+  /** Stream `remotePath` to a local file. Refuses to replace an existing file unless `overwrite`; creates no directories. */
+  async downloadToLocal(remotePath: string, localPath: string, mode: TransferMode = "binary", overwrite = false): Promise<LocalTransferResult> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
+    const dest = prepareDownloadTarget(localPath, overwrite);
+    const client = new Ssh2SftpClient();
+    try {
+      await client.connect(await this.buildClientOptions());
+      await client.fastGet(remotePath, dest.temp);
+      const { bytes, sha256 } = await hashLocalFile(dest.temp);
+      commitDownload(dest, overwrite);
+      return { localBytes: bytes, sha256, transferMode: "binary", localPath: dest.target };
+    } catch (error) {
+      discardTemp(dest.temp);
+      throw error;
+    } finally {
       await safeDisconnect(client);
     }
   }
@@ -187,15 +234,32 @@ export class SftpClient {
     }
   }
 
-  async appendFile(remotePath: string, content: string, encoding: FileEncoding = "utf8"): Promise<boolean> {
+  async appendFile(remotePath: string, content: string, encoding: FileEncoding = "utf8", mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
     const client = new Ssh2SftpClient();
     try {
+      const bytes = Buffer.from(content, encoding);
       await client.connect(await this.buildClientOptions());
-      await client.append(Buffer.from(content, encoding), remotePath);
-      return true;
+      await client.append(bytes, remotePath);
+      return { localBytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), transferMode: "binary" };
     } finally {
       await safeDisconnect(client);
     }
+  }
+
+  /** Stream a local file onto the end of `remotePath`. */
+  async appendLocalFile(remotePath: string, localPath: string, mode: TransferMode = "binary"): Promise<LocalTransferResult> {
+    if (mode === "ascii") throw new Error(SFTP_ASCII_MESSAGE);
+    const source = requireLocalSource(localPath);
+    const client = new Ssh2SftpClient();
+    try {
+      await client.connect(await this.buildClientOptions());
+      await client.append(fs.createReadStream(source), remotePath);
+    } finally {
+      await safeDisconnect(client);
+    }
+    const { bytes, sha256 } = await hashLocalFile(source);
+    return { localBytes: bytes, sha256, transferMode: "binary", localPath: source };
   }
 
   async rename(fromPath: string, toPath: string): Promise<boolean> {

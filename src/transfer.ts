@@ -11,6 +11,9 @@ import { createHash, randomUUID } from "crypto";
 
 export type TransferMode = "binary" | "ascii";
 
+export const SFTP_ASCII_MESSAGE =
+  'SFTP has no ASCII transfer mode (it moves bytes exactly). Use transferMode "binary", the default, or use protocol ftp for an ASCII transfer.';
+
 /**
  * What a transfer measured. Byte counts and the hash are always those of the
  * LOCAL side: in ASCII mode the wire and remote sizes legitimately differ

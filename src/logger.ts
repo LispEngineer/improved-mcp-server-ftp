@@ -24,6 +24,16 @@ export interface TransferLogEntry {
   encoding?: string;
   content?: string | Buffer;
   sha256?: string;
+  /** "binary" or "ascii"; for FTP only. Logged as `Mode`. */
+  transferMode?: string;
+  /**
+   * Set for localPath transfers. `sizeBytes` and `sha256` are then those of this
+   * LOCAL file (in ASCII mode the wire and remote sizes differ), and no file
+   * content is ever logged.
+   */
+  localPath?: string;
+  /** Bytes on the wire when they differ from `sizeBytes` (ASCII mode). */
+  wireBytes?: number;
   durationMs?: number;
   status: "SUCCESS" | "FAILED";
   error?: string;
@@ -138,6 +148,16 @@ export class TransferLogger {
     }
     if (entry.encoding) {
       lines.push(`Encoding     : ${entry.encoding}`);
+    }
+    if (entry.transferMode) {
+      lines.push(`Mode         : ${entry.transferMode.toUpperCase()}${entry.transferMode === "ascii" ? " (TYPE A: CR LF on the wire)" : ""}`);
+    }
+    if (entry.localPath) {
+      lines.push(`Local Path   : ${entry.localPath}`);
+      lines.push(`Local Note   : Size and SHA-256 are of this local file`);
+    }
+    if (entry.wireBytes !== undefined && entry.wireBytes !== entry.sizeBytes) {
+      lines.push(`Wire Bytes   : ${entry.wireBytes}`);
     }
     if (hash) {
       lines.push(`SHA-256      : ${hash}`);
