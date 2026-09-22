@@ -408,7 +408,9 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
 - **Tested on real hardware** (VAXstation 4000/60, OpenVMS VAX V7.3, 22-SEP-2026):
   - a 79,691,776-byte (76 MB) file up and down with `localPath`, in 93 s and 113 s (about 850 and 710 kB/s), SHA-256 identical, with no timeout;
   - a 1,000,003-byte file came back at exactly that size, with no padding to 512 bytes;
-  - the server's peak memory was 149 MB during the 76 MB transfer, so the file is not held whole.
+  - the server's peak memory was 149 MB during the 76 MB transfer, so the file is not held whole;
+  - 300 MB and 600 MB round trips through Claude Code's own MCP client were byte-identical, at about 870 kB/s up and 720 kB/s down. Peak memory stayed at 124-144 MB, so it does not grow with file size.
+- **Long transfers and MCP clients:** Claude Code does not time out a long tool call. After 120 s it moves the call to the background and delivers the result when it finishes; this was measured up to 14.5 minutes. Keep the client session open until then: a backgrounded call does not survive the session ending. Other clients have their own request timeouts; for example, the MCP TypeScript SDK defaults to 60 s unless the client raises it.
 - The FTP server wants a version to delete: `delete-file` retries `FILE.EXT` as `FILE.EXT;0`; `FILE.EXT;*` also works.
 - **Do not use `edit-file` on an OpenVMS text file.** It downloads and re-uploads in binary, so (from reading the code; not tested) the file comes back as fixed 512-byte records, like any text file sent in binary. Download it, edit it locally, and upload it with `transferMode: "ascii"`.
 - **Large files:** use `localPath`, which streams from and to disk. Sending a saveset as base64 `content` puts the whole file through the conversation.
