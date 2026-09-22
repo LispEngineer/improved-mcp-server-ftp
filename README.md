@@ -15,6 +15,14 @@ Improvements:
 Improver: Douglas P. Fields, Jr. (`symbolics@lisp.engineer`) with Gemini 3.8 Flash
 and Claude Sonnet 5
 
+> **Upgrading? Reconnect every running client.** An MCP client keeps the server
+> process it started with, and so keeps that version's tool schema, until it
+> reconnects the server (in Claude Code: `/mcp`, then reconnect). A client started before
+> an upgrade to 1.5.0 has no `localPath` or `transferMode`, even though the new build is
+> installed. Check what a client is really talking to with `tools/list`: 1.5.0 reports
+> server version `1.5.0`, and `upload-file` requires only `remotePath`. (This caught two
+> separate sessions during the 1.5.0 rollout.)
+
 ---
 
 [![MseeP.ai Security Assessment Badge](https://mseep.net/pr/alxspiker-mcp-server-ftp-badge.png)](https://mseep.ai/app/alxspiker-mcp-server-ftp)
@@ -396,7 +404,11 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
 - **Directory listing parser**: Dedicated fallback parser for OpenVMS `LIST` output (`FILENAME.EXT;VER`, 512-byte blocks, ISO date conversion, `*.DIR;*` subdirectories, and 2-line wrapped entries).
 - **Versioned deletion**: Automatically retries unversioned deletions with `;0` (latest version) when OpenVMS requires a version specification.
 - **Path normalization**: Translates `.` and `./` to `""` for current-directory listings.
-- **Text files need `transferMode: "ascii"`.** A `.COM` (or any text) file sent in binary mode arrives as *Fixed length 512 byte records*, and DCL refuses to run it (`%RMS-W-RTB, 512 byte record too large for user's buffer`). Sent in ASCII mode it lands as *Variable length, Carriage return carriage control* and runs. Measured on a SIMH-simulated VAX running OpenVMS VAX V7.3 with TCP/IP Services; see `LOCALPATH_AND_ASCII_REPORT.md`. Binary files (savesets) go in binary mode.
+- **Text files need `transferMode: "ascii"`.** A `.COM` (or any text) file sent in binary mode arrives as *Fixed length 512 byte records*, and DCL refuses to run it (`%RMS-W-RTB, 512 byte record too large for user's buffer`). Sent in ASCII mode it lands as *Variable length, Carriage return carriage control* and runs. Measured on a SIMH-simulated VAX running OpenVMS VAX V7.3 with TCP/IP Services (see `LOCALPATH_AND_ASCII_REPORT.md`), and again on real hardware, a VAXstation 4000/60 on the LAN (22-SEP-2026). Binary files (savesets) go in binary mode.
+- **Tested on real hardware** (VAXstation 4000/60, OpenVMS VAX V7.3, 22-SEP-2026):
+  - a 79,691,776-byte (76 MB) file up and down with `localPath`, in 93 s and 113 s (about 850 and 710 kB/s), SHA-256 identical, with no timeout;
+  - a 1,000,003-byte file came back at exactly that size, with no padding to 512 bytes;
+  - the server's peak memory was 149 MB during the 76 MB transfer, so the file is not held whole.
 - The FTP server wants a version to delete: `delete-file` retries `FILE.EXT` as `FILE.EXT;0`; `FILE.EXT;*` also works.
 - **Do not use `edit-file` on an OpenVMS text file.** It downloads and re-uploads in binary, so (from reading the code; not tested) the file comes back as fixed 512-byte records, like any text file sent in binary. Download it, edit it locally, and upload it with `transferMode: "ascii"`.
 - **Large files:** use `localPath`, which streams from and to disk. Sending a saveset as base64 `content` puts the whole file through the conversation.
