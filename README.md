@@ -84,11 +84,17 @@ The server is published as [`mcp-server-ftp`](https://www.npmjs.com/package/mcp-
 ### Building from source
 
 ```bash
-git clone https://github.com/alxspiker/mcp-server-ftp.git
-cd mcp-server-ftp
+git clone https://github.com/LispEngineer/improved-mcp-server-ftp.git
+cd improved-mcp-server-ftp
 npm install
 npm run build
 ```
+
+The Smithery and npm packages above are the original upstream
+(`alxspiker/mcp-server-ftp`), which has none of the improvements listed at the
+top of this file. Build from source to get them. A client that is already
+running keeps the old server process, and the old tool schema, until it
+reconnects the server (in Claude Code: `/mcp`, then reconnect).
 
 ## Testing
 
@@ -265,6 +271,10 @@ npm run encrypt-env -- <plaintext-value>
 | `edit-file` | Replace exact text in a remote text file |
 | `append-file` | Append `content` or a local file (`localPath`) to a file, creating it if needed |
 
+`download-file` is not annotated read-only (since 1.5.0): with `localPath` it
+writes a local file. A client that auto-approves read-only tools will ask
+before a download.
+
 Tool calls return machine-readable `structuredContent`, and all nine tools advertise output schemas. Version 1.2.2 includes a compatibility shim that ensures advertised schemas use the JSON Schema 2020-12 dialect required by current MCP clients.
 
 ## Dynamic connection parameters (multi-host targeting)
@@ -337,7 +347,8 @@ Each transfer event records a structured human-readable block containing:
 
 File content is never written to the log. `localPath` transfers are streamed in chunks and never loaded whole.
 
-### Example log entry
+### Example log entries
+A `content` upload (1.4.0 format; since 1.5.0 it also has a `Mode` line):
 ```text
 ================================================================================
 [2026-09-14T19:15:30.123Z] FTP TRANSFER: UPLOAD - SUCCESS
@@ -348,6 +359,23 @@ Size         : 42 B (42 bytes)
 Encoding     : utf8
 SHA-256      : a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e
 Duration     : 145 ms (289.66 B/s)
+================================================================================
+```
+
+A `localPath` upload in ASCII mode to OpenVMS (1.5.0; local path shortened):
+```text
+================================================================================
+[2026-09-21T13:57:43.770Z] FTP TRANSFER: UPLOAD - SUCCESS
+Target       : 10.73.0.109:21 (USER1)
+Protocol     : FTP
+Remote Path  : [.FTPTEST_0921]ASC3.COM
+Size         : 89 B (89 bytes)
+Mode         : ASCII (TYPE A: CR LF on the wire)
+Local Path   : /tmp/.../vms-test/T3.COM
+Local Note   : Size and SHA-256 are of this local file
+Wire Bytes   : 92
+SHA-256      : 2df65ff21263df0fc388236952f6e2d604c29421c5e0cfcf5a968b0d0a3ad1e9
+Duration     : 110 ms (809.09 B/s)
 ================================================================================
 ```
 
@@ -370,6 +398,9 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
 - **Path normalization**: Translates `.` and `./` to `""` for current-directory listings.
 - **Text files need `transferMode: "ascii"`.** A `.COM` (or any text) file sent in binary mode arrives as *Fixed length 512 byte records*, and DCL refuses to run it (`%RMS-W-RTB, 512 byte record too large for user's buffer`). Sent in ASCII mode it lands as *Variable length, Carriage return carriage control* and runs. Measured on a SIMH-simulated VAX running OpenVMS VAX V7.3 with TCP/IP Services; see `LOCALPATH_AND_ASCII_REPORT.md`. Binary files (savesets) go in binary mode.
 - The FTP server wants a version to delete: `delete-file` retries `FILE.EXT` as `FILE.EXT;0`; `FILE.EXT;*` also works.
+- **Do not use `edit-file` on an OpenVMS text file.** It downloads and re-uploads in binary, so (from reading the code; not tested) the file comes back as fixed 512-byte records, like any text file sent in binary. Download it, edit it locally, and upload it with `transferMode: "ascii"`.
+- **Large files:** use `localPath`, which streams from and to disk. Sending a saveset as base64 `content` puts the whole file through the conversation.
+- Do not create directories on OpenVMS with `create-directory`: with the TCP/IP Services FTP server this has been seen to create an ordinary file instead of a directory. Create them in DCL (`CREATE/DIRECTORY`).
 
 ## Security notes
 
@@ -393,6 +424,7 @@ Version 1.3.0 includes native support for OpenVMS TCP/IP Services FTP servers:
   - **Douglas P. Fields, Jr.** (`symbolics@lisp.engineer`):
     - Version 1.3.0 — Dynamic per-transaction host and credential parameters, OpenVMS directory listing parser, OpenVMS versioned deletion semantics, and graceful environment fallback.
     - Version 1.4.0 — Persistent transfer audit logging (`ftp_transfers.log`) with ISO timestamps, file sizes, SHA-256 integrity hashes, transfer rate metrics, and configurable log directories mirroring the Telnet/Serial MCP architecture.
+    - Version 1.5.0 (with Claude Sonnet 5) — `localPath` streaming of local files for upload, append and download (any size; atomic download with `overwrite` protection); FTP ASCII transfer mode (`transferMode`) with a chunk-safe LF / CR LF converter and `TYPE I` restored afterwards; `Mode` / `Local Path` / `Wire Bytes` log fields; updated output schemas; and an `npm test` suite that needs no remote machine. Details and measurements: `LOCALPATH_AND_ASCII_REPORT.md`.
 
 ## License
 
